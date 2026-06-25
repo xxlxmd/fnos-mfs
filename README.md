@@ -193,6 +193,37 @@ systemctl status <service> --no-pager
 journalctl -u <service> -n 100 --no-pager
 ```
 
+## Release
+
+仓库包含一个手动触发的 prerelease workflow：
+
+```text
+.github/workflows/prerelease.yml
+```
+
+在 GitHub Actions 里运行 `Prerelease`，输入 tag，比如：
+
+```text
+v0.1.0-dev
+```
+
+workflow 会执行：
+
+```text
+go test ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build
+创建或更新 GitHub prerelease
+上传 dist/fnos-mfs-linux-amd64
+```
+
+## 免责声明
+
+本工具会修改系统挂载、ACL、FUSE 和 systemd 配置。使用前请自行确认数据备份和命令影响。作者不对数据丢失、服务中断或系统配置损坏负责。
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
+
 ## 构建
 
 ```bash

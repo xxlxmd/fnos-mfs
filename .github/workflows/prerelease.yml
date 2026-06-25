@@ -1,0 +1,66 @@
+name: Prerelease
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Prerelease tag"
+        required: true
+        default: "v0.1.0-dev"
+      title:
+        description: "Release title"
+        required: true
+        default: "fnos-mfs v0.1.0-dev"
+
+permissions:
+  contents: write
+
+jobs:
+  prerelease:
+    name: Build and publish prerelease
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build Linux amd64
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/fnos-mfs-linux-amd64 .
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
+        run: |
+          set -euo pipefail
+
+          notes=$(cat <<'NOTES'
+          fnos-mfs prerelease build.
+
+          This binary modifies mergerfs, ACL, fuse, and systemd configuration.
+          Test on non-critical data first and keep backups.
+          NOTES
+          )
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/fnos-mfs-linux-amd64 --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes "$notes" --prerelease
+          else
+            gh release create "$TAG" dist/fnos-mfs-linux-amd64 \
+              --title "$TITLE" \
+              --notes "$notes" \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          fi
