@@ -155,6 +155,44 @@ service_name       systemd 服务名
 底层目录 rwx + default rwx
 ```
 
+## 错误处理
+
+菜单会持续运行。`status`、`discover` 或一次失败的 `set` 不会直接退出，只有选择 `exit` 才退出。
+
+遇到错误时，工具会输出：
+
+```text
+错误: 具体失败原因
+修复建议:
+ - 下一步处理方式
+```
+
+常见情况：
+
+```text
+没有发现 /vol1 /vol2
+先确认 fnOS 存储空间已挂载：
+ls -ld /vol*
+findmnt | grep /vol
+
+需要 root 权限
+用 sudo 运行：
+sudo ./fnos-mfs
+
+缺少依赖
+在工具里选 install，或手动执行：
+apt update && apt install -y mergerfs fuse3 acl
+
+ACL 失败
+确认 App 用户存在：
+id <appuser>
+
+systemd 启动失败
+查看状态和日志：
+systemctl status <service> --no-pager
+journalctl -u <service> -n 100 --no-pager
+```
+
 ## 构建
 
 ```bash

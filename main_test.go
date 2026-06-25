@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -88,6 +89,24 @@ func TestPromptCustomApp(t *testing.T) {
 	}
 	if !reflect.DeepEqual(app.UserCandidates, []string{"app.user"}) {
 		t.Fatalf("user candidates = %v", app.UserCandidates)
+	}
+}
+
+func TestActionMenuReturnsAfterStatus(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	reader := bufio.NewReader(strings.NewReader("4\n6\n"))
+	app := AppConfig{ID: "fnvideo", Label: "飞牛影视", DefaultPoolName: ".media_pool", DefaultMountDir: "影视聚合"}
+	if err := runActionMenu(reader, app); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestActionMenuContinuesAfterActionError(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	reader := bufio.NewReader(strings.NewReader("1\n6\n"))
+	app := AppConfig{ID: "fnvideo", Label: "飞牛影视", DefaultPoolName: ".media_pool", DefaultMountDir: "影视聚合"}
+	if err := runActionMenu(reader, app); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -315,6 +334,29 @@ func TestDependencyStatusItems(t *testing.T) {
 	}
 	if items[2].State != statusFail || !strings.Contains(items[2].Detail, "getfacl") {
 		t.Fatalf("expected acl failure for getfacl: %+v", items[2])
+	}
+}
+
+func TestRepairSuggestions(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "root", err: errors.New("需要 root 权限，请用 sudo fnos-mfs 运行"), want: "sudo ./fnos-mfs"},
+		{name: "volumes", err: errors.New("没有发现 /vol1 /vol2 这类卷"), want: "findmnt | grep /vol"},
+		{name: "dependencies", err: errDependencyInstallDeclined, want: "apt install -y mergerfs fuse3 acl"},
+		{name: "app user", err: errors.New("App 用户为空，不能补 ACL"), want: "真实 App Linux 用户名"},
+		{name: "acl", err: errors.New("setfacl -m u:trim.media:--x /vol1: exit status 1"), want: "id <appuser>"},
+		{name: "systemd", err: errors.New("systemctl restart fnos-mfs-fnvideo.service: exit status 1"), want: "journalctl -u <service>"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := strings.Join(repairSuggestions(tt.err), "\n")
+			if !strings.Contains(got, tt.want) {
+				t.Fatalf("suggestions = %q, want contains %q", got, tt.want)
+			}
+		})
 	}
 }
 

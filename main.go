@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -113,6 +114,8 @@ const (
 	customAppName = "Other"
 )
 
+var errDependencyInstallDeclined = errors.New("缺少依赖，已取消安装")
+
 func main() {
 	if len(os.Args) > 1 {
 		fmt.Println("fnos-mfs 是交互式工具，不需要参数。直接运行：fnos-mfs")
@@ -156,33 +159,41 @@ func main() {
 }
 
 func runActionMenu(reader *bufio.Reader, app AppConfig) error {
-	action, err := chooseOne(reader, "选择操作", []string{
-		"set - 配置/修改 MFS 聚合目录",
-		"discover - 发现当前 /vol 卷",
-		"acl - 给当前 App 补权限",
-		"status - 查看当前 App 状态",
-		"install - 安装 mergerfs/fuse3/acl",
-		"exit - 退出",
-	})
-	if err != nil {
-		exitErr(err)
-	}
+	for {
+		action, err := chooseOne(reader, "选择操作", []string{
+			"set - 配置/修改 MFS 聚合目录",
+			"discover - 发现当前 /vol 卷",
+			"acl - 给当前 App 补权限",
+			"status - 查看当前 App 状态",
+			"install - 安装 mergerfs/fuse3/acl",
+			"exit - 退出",
+		})
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				fmt.Println()
+				return nil
+			}
+			return err
+		}
 
-	switch {
-	case strings.HasPrefix(action, "set"):
-		err = runSet(reader, app)
-	case strings.HasPrefix(action, "discover"):
-		err = runDiscover()
-	case strings.HasPrefix(action, "acl"):
-		err = runACL(reader, app)
-	case strings.HasPrefix(action, "status"):
-		err = runStatus(app)
-	case strings.HasPrefix(action, "install"):
-		err = runInstall(reader)
-	case strings.HasPrefix(action, "exit"):
-		return nil
+		switch {
+		case strings.HasPrefix(action, "set"):
+			err = runSet(reader, app)
+		case strings.HasPrefix(action, "discover"):
+			err = runDiscover()
+		case strings.HasPrefix(action, "acl"):
+			err = runACL(reader, app)
+		case strings.HasPrefix(action, "status"):
+			err = runStatus(app)
+		case strings.HasPrefix(action, "install"):
+			err = runInstall(reader)
+		case strings.HasPrefix(action, "exit"):
+			return nil
+		}
+		if err != nil {
+			printError(err)
+		}
 	}
-	return err
 }
 
 func loadConfig() (Config, error) {
@@ -766,14 +777,14 @@ func buildSetupPlan(app AppConfig, appUser string, owner OwnerCandidate, poolNam
 func applySetup(plan SetupPlan) error {
 	for _, branch := range plan.Branches {
 		if err := os.MkdirAll(branch.BranchPath, 0775); err != nil {
-			return err
+			return fmt.Errorf("创建底层目录失败 %s: %w", branch.BranchPath, err)
 		}
 	}
 	if err := os.MkdirAll(plan.MountPoint, 0775); err != nil {
-		return err
+		return fmt.Errorf("创建聚合入口失败 %s: %w", plan.MountPoint, err)
 	}
 	if err := chownIfKnown(plan.Owner, append(branchPaths(plan.Branches), plan.MountPoint)); err != nil {
-		return err
+		return fmt.Errorf("设置 owner 失败: %w", err)
 	}
 	state := AppState{
 		AppID: plan.App.ID, AppLabel: plan.App.Label, AppUser: plan.AppUser,
@@ -781,25 +792,25 @@ func applySetup(plan SetupPlan) error {
 		ServiceName: plan.App.ServiceName, Branches: plan.Branches,
 	}
 	if err := applyACL(state, plan.AppUser); err != nil {
-		return err
+		return fmt.Errorf("设置 ACL 失败: %w", err)
 	}
 	if err := ensureFuseAllowOther(); err != nil {
-		return err
+		return fmt.Errorf("更新 /etc/fuse.conf 失败: %w", err)
 	}
 	if err := writeState(state); err != nil {
-		return err
+		return fmt.Errorf("写入状态文件失败: %w", err)
 	}
 	if err := writeService(state); err != nil {
-		return err
+		return fmt.Errorf("写入 systemd 服务失败: %w", err)
 	}
 	if err := runCommand("systemctl", "daemon-reload"); err != nil {
-		return err
+		return fmt.Errorf("刷新 systemd 失败: %w", err)
 	}
 	if err := runCommand("systemctl", "enable", state.ServiceName+".service"); err != nil {
-		return err
+		return fmt.Errorf("启用 systemd 服务失败: %w", err)
 	}
 	if err := runCommand("systemctl", "restart", state.ServiceName+".service"); err != nil {
-		return err
+		return fmt.Errorf("启动 systemd 服务失败: %w", err)
 	}
 	return nil
 }
@@ -810,16 +821,16 @@ func applyACL(state AppState, appUser string) error {
 	}
 	for _, ancestor := range aclAncestors(state) {
 		if err := runCommand("setfacl", "-m", "u:"+appUser+":--x", ancestor); err != nil {
-			return err
+			return fmt.Errorf("设置父目录通行权限失败 %s: %w", ancestor, err)
 		}
 	}
 	targets := append(branchPaths(state.Branches), state.MountPoint)
 	for _, target := range targets {
 		if err := runCommand("setfacl", "-Rm", "u:"+appUser+":rwx", target); err != nil {
-			return err
+			return fmt.Errorf("设置目录权限失败 %s: %w", target, err)
 		}
 		if err := runCommand("setfacl", "-dm", "u:"+appUser+":rwx", target); err != nil {
-			return err
+			return fmt.Errorf("设置默认权限失败 %s: %w", target, err)
 		}
 	}
 	return nil
@@ -964,8 +975,11 @@ func ensureDependencies(reader *bufio.Reader) error {
 	}
 	fmt.Printf("缺少命令: %s\n", strings.Join(missing, ", "))
 	ok, err := confirm(reader, "现在安装依赖")
-	if err != nil || !ok {
+	if err != nil {
 		return err
+	}
+	if !ok {
+		return errDependencyInstallDeclined
 	}
 	return installDependencies()
 }
@@ -975,9 +989,12 @@ func installDependencies() error {
 		return errors.New("没有找到 apt，无法自动安装")
 	}
 	if err := runCommand("apt", "update"); err != nil {
-		return err
+		return fmt.Errorf("apt update 失败: %w", err)
 	}
-	return runCommand("apt", "install", "-y", "mergerfs", "fuse3", "acl")
+	if err := runCommand("apt", "install", "-y", "mergerfs", "fuse3", "acl"); err != nil {
+		return fmt.Errorf("apt install 失败: %w", err)
+	}
+	return nil
 }
 
 func missingCommands(commands []string) []string {
@@ -1003,7 +1020,10 @@ func runCommand(name string, args ...string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	}
+	return nil
 }
 
 func printCommand(name string, args ...string) {
@@ -1293,6 +1313,72 @@ func sanitizeID(value string, fallback string) string {
 }
 
 func exitErr(err error) {
-	fmt.Fprintln(os.Stderr, "错误:", err)
+	printError(err)
 	os.Exit(1)
+}
+
+func printError(err error) {
+	fmt.Fprintln(os.Stderr, "错误:", err)
+	suggestions := repairSuggestions(err)
+	if len(suggestions) == 0 {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "修复建议:")
+	for _, suggestion := range suggestions {
+		fmt.Fprintln(os.Stderr, " - "+suggestion)
+	}
+}
+
+func repairSuggestions(err error) []string {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	var suggestions []string
+	add := func(s string) {
+		for _, existing := range suggestions {
+			if existing == s {
+				return
+			}
+		}
+		suggestions = append(suggestions, s)
+	}
+	switch {
+	case strings.Contains(msg, "需要 root 权限"):
+		add("用 sudo 运行：sudo ./fnos-mfs")
+	case strings.Contains(msg, "没有发现 /vol1 /vol2"):
+		add("先在 fnOS 里确认存储空间已挂载，再运行 discover。")
+		add("可用命令检查：ls -ld /vol* && findmnt | grep /vol")
+	case strings.Contains(msg, "set 至少选择两个卷"):
+		add("set 做聚合至少选两个卷，例如选择 1,2 或 2,3,4。")
+	case strings.Contains(msg, "没有找到") && strings.Contains(msg, "状态文件"):
+		add("先执行 set 生成 /etc/fnos-mfs/<app>.json。")
+	case errors.Is(err, errDependencyInstallDeclined):
+		add("重新进入 install，或手动执行：apt update && apt install -y mergerfs fuse3 acl")
+	case strings.Contains(msg, "没有找到 apt"):
+		add("当前系统没有 apt，需手动安装 mergerfs、fuse3、acl。")
+	case strings.Contains(msg, "App 用户为空"):
+		add("回到 set，选择修改其他选项，填写真实 App Linux 用户名。")
+	case strings.Contains(msg, "创建底层目录失败") || strings.Contains(msg, "创建聚合入口失败"):
+		add("确认所选 /volX 已挂载，且 home 目录存在，例如 /vol1/1000。")
+		add("确认用 sudo/root 运行。")
+	case strings.Contains(msg, "setfacl"):
+		add("确认 acl 已安装：apt install -y acl")
+		add("确认 App 用户存在：id <appuser>")
+		add("确认目标目录存在且在选中的 /volX 下。")
+	case strings.Contains(msg, "apt update") || strings.Contains(msg, "apt install"):
+		add("检查网络和 apt 源，然后重试 install。")
+		add("也可以手动执行：apt update && apt install -y mergerfs fuse3 acl")
+	case strings.Contains(msg, "systemctl"):
+		add("查看服务状态：systemctl status <service> --no-pager")
+		add("查看详细日志：journalctl -u <service> -n 100 --no-pager")
+	case strings.Contains(msg, "/etc/fuse.conf"):
+		add("确认 fuse3 已安装，并用 sudo/root 运行。")
+	case strings.Contains(msg, "exit status"):
+		add("查看上一条失败命令的输出；若是 systemd，继续执行：systemctl status <service> --no-pager")
+		add("若是 ACL 失败，确认 App 用户存在：id <appuser>")
+	case strings.Contains(msg, "permission denied") || strings.Contains(msg, "operation not permitted"):
+		add("确认使用 sudo/root 运行，并确认目标目录属于 fnOS 存储空间。")
+	}
+	return suggestions
 }
