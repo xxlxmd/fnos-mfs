@@ -88,6 +88,8 @@ type SetupPlan struct {
 	Branches   []BranchState
 }
 
+type commandOutputFunc func(name string, args ...string) string
+
 func main() {
 	if len(os.Args) > 1 {
 		fmt.Println("fnos-mfs 是交互式工具，不需要参数。直接运行：fnos-mfs")
@@ -155,7 +157,37 @@ func loadConfig() (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
 	}
+	if err := validateConfig(cfg); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+func validateConfig(cfg Config) error {
+	if len(cfg.Apps) == 0 {
+		return errors.New("apps 不能为空")
+	}
+	seen := map[string]bool{}
+	for _, app := range cfg.Apps {
+		switch {
+		case app.ID == "":
+			return errors.New("app id 不能为空")
+		case seen[app.ID]:
+			return fmt.Errorf("app id 重复: %s", app.ID)
+		case app.Label == "":
+			return fmt.Errorf("%s label 不能为空", app.ID)
+		case app.DefaultPoolName == "":
+			return fmt.Errorf("%s default_pool_name 不能为空", app.ID)
+		case app.DefaultMountDir == "":
+			return fmt.Errorf("%s default_mount_dir 不能为空", app.ID)
+		case app.PathTemplate == "":
+			return fmt.Errorf("%s path_template 不能为空", app.ID)
+		case app.ServiceName == "":
+			return fmt.Errorf("%s service_name 不能为空", app.ID)
+		}
+		seen[app.ID] = true
+	}
+	return nil
 }
 
 func chooseApp(reader *bufio.Reader, apps []AppConfig) (AppConfig, error) {
@@ -313,7 +345,11 @@ func runInstall(reader *bufio.Reader) error {
 }
 
 func discoverVolumes() ([]Volume, error) {
-	entries, err := os.ReadDir("/")
+	return discoverVolumesIn("/", commandOutput)
+}
+
+func discoverVolumesIn(root string, command commandOutputFunc) ([]Volume, error) {
+	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, err
 	}
@@ -323,11 +359,14 @@ func discoverVolumes() ([]Volume, error) {
 		if !entry.IsDir() || !volName.MatchString(entry.Name()) {
 			continue
 		}
-		path := filepath.Join("/", entry.Name())
+		path := filepath.Join(root, entry.Name())
+		if root == "/" {
+			path = filepath.Join("/", entry.Name())
+		}
 		vol := Volume{Name: entry.Name(), Path: path}
-		vol.Device = commandOutput("findmnt", "-no", "SOURCE", path)
-		vol.FSType = commandOutput("findmnt", "-no", "FSTYPE", path)
-		vol.UUID = findUUID(path, vol.Device)
+		vol.Device = command("findmnt", "-no", "SOURCE", path)
+		vol.FSType = command("findmnt", "-no", "FSTYPE", path)
+		vol.UUID = findUUIDWithCommand(path, vol.Device, command)
 		if vol.Device != "" {
 			vol.MountState = "mounted"
 		}
@@ -340,12 +379,16 @@ func discoverVolumes() ([]Volume, error) {
 }
 
 func findUUID(mountPoint string, device string) string {
-	uuid := commandOutput("findmnt", "-no", "UUID", mountPoint)
+	return findUUIDWithCommand(mountPoint, device, commandOutput)
+}
+
+func findUUIDWithCommand(mountPoint string, device string, command commandOutputFunc) string {
+	uuid := command("findmnt", "-no", "UUID", mountPoint)
 	if uuid != "" {
 		return uuid
 	}
 	if device != "" {
-		uuid = commandOutput("lsblk", "-no", "UUID", device)
+		uuid = command("lsblk", "-no", "UUID", device)
 	}
 	return uuid
 }
@@ -522,7 +565,10 @@ func applySetup(plan SetupPlan) error {
 	if err := runCommand("systemctl", "daemon-reload"); err != nil {
 		return err
 	}
-	if err := runCommand("systemctl", "enable", "--now", state.ServiceName+".service"); err != nil {
+	if err := runCommand("systemctl", "enable", state.ServiceName+".service"); err != nil {
+		return err
+	}
+	if err := runCommand("systemctl", "restart", state.ServiceName+".service"); err != nil {
 		return err
 	}
 	return nil
@@ -606,7 +652,7 @@ func renderService(state AppState, mergerfsPath string, fusermountPath string) s
 	fmt.Fprintf(&buf, "[Unit]\n")
 	fmt.Fprintf(&buf, "Description=FNOS MFS %s\n", state.AppID)
 	fmt.Fprintf(&buf, "After=local-fs.target\n")
-	fmt.Fprintf(&buf, "RequiresMountsFor=%s\n\n", strings.Join(requires, " "))
+	fmt.Fprintf(&buf, "RequiresMountsFor=%s\n\n", systemdPathList(requires))
 	fmt.Fprintf(&buf, "[Service]\n")
 	fmt.Fprintf(&buf, "Type=simple\n")
 	fmt.Fprintf(&buf, "Environment=%s\n", systemdEnv("MFS_MERGERFS", mergerfsPath))
@@ -626,6 +672,34 @@ func renderService(state AppState, mergerfsPath string, fusermountPath string) s
 func systemdEnv(key string, value string) string {
 	escaped := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", "").Replace(key + "=" + value)
 	return `"` + escaped + `"`
+}
+
+func systemdPathList(paths []string) string {
+	escaped := make([]string, 0, len(paths))
+	for _, path := range paths {
+		escaped = append(escaped, systemdPathValue(path))
+	}
+	return strings.Join(escaped, " ")
+}
+
+func systemdPathValue(path string) string {
+	var b strings.Builder
+	for _, r := range path {
+		switch r {
+		case ' ':
+			b.WriteString(`\x20`)
+		case '\t':
+			b.WriteString(`\x09`)
+		case '\n', '\r':
+			// Unit values are line based. Drop line breaks rather than emitting
+			// an invalid directive.
+		case '\\':
+			b.WriteString(`\\`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func ensureFuseAllowOther() error {
@@ -833,7 +907,7 @@ func chooseMany(reader *bufio.Reader, title string, options []string) ([]string,
 }
 
 func parseSelection(input string, count int) ([]int, error) {
-	input = strings.TrimSpace(input)
+	input = strings.TrimSpace(strings.ToLower(input))
 	if input == "all" || input == "*" {
 		indexes := make([]int, 0, count)
 		for i := 0; i < count; i++ {
@@ -843,7 +917,10 @@ func parseSelection(input string, count int) ([]int, error) {
 	}
 	seen := map[int]bool{}
 	var indexes []int
-	for _, part := range strings.Split(input, ",") {
+	parts := strings.FieldsFunc(input, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue

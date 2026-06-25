@@ -1,3 +1,4 @@
 fnos-mfs
+dist/
 *.log
 .DS_Store
