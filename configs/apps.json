@@ -1,0 +1,40 @@
+{
+  "apps": [
+    {
+      "id": "fnvideo",
+      "label": "飞牛影视",
+      "default_pool_name": ".media_pool",
+      "default_mount_dir": "影视文件合集",
+      "path_template": "{primary}/{home}/{mount_dir}",
+      "user_candidates": ["trim.media", "trim-media"],
+      "service_name": "fnos-mfs-fnvideo"
+    },
+    {
+      "id": "fnmusic",
+      "label": "飞牛音乐",
+      "default_pool_name": ".music_pool",
+      "default_mount_dir": "音乐文件合集",
+      "path_template": "{primary}/{home}/{mount_dir}",
+      "user_candidates": ["trim.music", "trim-music", "fnmusic"],
+      "service_name": "fnos-mfs-fnmusic"
+    },
+    {
+      "id": "fnxunlei",
+      "label": "飞牛迅雷",
+      "default_pool_name": ".xunlei_pool",
+      "default_mount_dir": "迅雷下载合集",
+      "path_template": "{primary}/{home}/{mount_dir}",
+      "user_candidates": ["trim.xunlei", "trim-xunlei", "xunlei"],
+      "service_name": "fnos-mfs-fnxunlei"
+    },
+    {
+      "id": "fnaria2",
+      "label": "Aria2",
+      "default_pool_name": ".aria2_pool",
+      "default_mount_dir": "Aria2下载合集",
+      "path_template": "{primary}/{home}/{mount_dir}",
+      "user_candidates": ["trim.aria2", "trim-aria2", "aria2"],
+      "service_name": "fnos-mfs-fnaria2"
+    }
+  ]
+}
