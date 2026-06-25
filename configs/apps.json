@@ -4,7 +4,7 @@
       "id": "fnvideo",
       "label": "飞牛影视",
       "default_pool_name": ".media_pool",
-      "default_mount_dir": "影视文件合集",
+      "default_mount_dir": "影视聚合",
       "path_template": "{primary}/{home}/{mount_dir}",
       "user_candidates": ["trim.media", "trim-media"],
       "service_name": "fnos-mfs-fnvideo"

@@ -58,6 +58,39 @@ func TestValidateConfigRejectsDuplicateAppID(t *testing.T) {
 	}
 }
 
+func TestChooseAppSupportsOther(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("5\n"))
+	selection, err := chooseApp(reader, []AppConfig{
+		{ID: "fnvideo", Label: "飞牛影视"},
+		{ID: "fnmusic", Label: "飞牛音乐"},
+		{ID: "fnxunlei", Label: "飞牛迅雷"},
+		{ID: "fnaria2", Label: "Aria2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !selection.Other {
+		t.Fatal("expected other selection")
+	}
+}
+
+func TestPromptCustomApp(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("My App\n我的应用\napp.user\n.pool\n聚合\n"))
+	app, err := promptCustomApp(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.ID != "my-app" {
+		t.Fatalf("id = %q, want my-app", app.ID)
+	}
+	if app.ServiceName != "fnos-mfs-my-app" {
+		t.Fatalf("service = %q", app.ServiceName)
+	}
+	if !reflect.DeepEqual(app.UserCandidates, []string{"app.user"}) {
+		t.Fatalf("user candidates = %v", app.UserCandidates)
+	}
+}
+
 func TestParseSelection(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -200,6 +233,47 @@ func TestBuildSetupPlan(t *testing.T) {
 	}
 }
 
+func TestMaybeCustomizePlanKeepsDefaults(t *testing.T) {
+	plan := SetupPlan{
+		App:        AppConfig{ID: "fnvideo"},
+		AppUser:    "trim.media",
+		Owner:      OwnerCandidate{HomeName: "1000"},
+		PoolName:   ".media_pool",
+		MountPoint: "/vol1/1000/影视聚合",
+		Volumes:    []Volume{{Path: "/vol1"}},
+	}
+	reader := bufio.NewReader(strings.NewReader("\n"))
+	got, err := maybeCustomizePlan(reader, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, plan) {
+		t.Fatalf("plan changed: %+v", got)
+	}
+}
+
+func TestMaybeCustomizePlanAppliesOverrides(t *testing.T) {
+	plan := SetupPlan{
+		App:        AppConfig{ID: "fnvideo"},
+		AppUser:    "trim.media",
+		Owner:      OwnerCandidate{HomeName: "1000"},
+		PoolName:   ".media_pool",
+		MountPoint: "/vol1/1000/影视聚合",
+		Volumes:    []Volume{{Path: "/vol1"}, {Path: "/vol2"}},
+	}
+	reader := bufio.NewReader(strings.NewReader("yes\ncustom.user\n.custom_pool\n/vol1/1000/custom\n"))
+	got, err := maybeCustomizePlan(reader, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppUser != "custom.user" || got.PoolName != ".custom_pool" || got.MountPoint != "/vol1/1000/custom" {
+		t.Fatalf("unexpected overrides: %+v", got)
+	}
+	if got.Branches[1].BranchPath != "/vol2/1000/.custom_pool" {
+		t.Fatalf("branch not rebuilt: %+v", got.Branches)
+	}
+}
+
 func TestAclAncestors(t *testing.T) {
 	state := AppState{
 		Owner:      OwnerCandidate{HomeName: "1000"},
@@ -222,6 +296,34 @@ func TestSystemdHelpers(t *testing.T) {
 	}
 	if got := systemdEnv("MFS_MOUNT", `/vol1/1000/"Media"\A`); got != `"MFS_MOUNT=/vol1/1000/\"Media\"\\A"` {
 		t.Fatalf("systemdEnv = %q", got)
+	}
+}
+
+func TestDependencyStatusItems(t *testing.T) {
+	lookPath := func(command string) (string, error) {
+		if command == "getfacl" {
+			return "", os.ErrNotExist
+		}
+		return "/usr/bin/" + command, nil
+	}
+	items := dependencyStatusItems(lookPath)
+	if len(items) != 3 {
+		t.Fatalf("len = %d, want 3", len(items))
+	}
+	if items[0].State != statusOK || items[1].State != statusOK {
+		t.Fatalf("expected first two dependencies ok: %+v", items)
+	}
+	if items[2].State != statusFail || !strings.Contains(items[2].Detail, "getfacl") {
+		t.Fatalf("expected acl failure for getfacl: %+v", items[2])
+	}
+}
+
+func TestRenderStatusItemNoColor(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	got := renderStatusItem(StatusItem{State: statusOK, Label: "mergerfs", Detail: "已安装"})
+	want := "[OK] mergerfs: 已安装"
+	if got != want {
+		t.Fatalf("status item = %q, want %q", got, want)
 	}
 }
 
@@ -259,5 +361,14 @@ func TestNaturalVolLess(t *testing.T) {
 	want := []string{"vol1", "vol2", "vol10"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("names = %v, want %v", names, want)
+	}
+}
+
+func TestSanitizeID(t *testing.T) {
+	if got := sanitizeID(" My App_01 ", "fallback"); got != "my-app-01" {
+		t.Fatalf("sanitizeID = %q", got)
+	}
+	if got := sanitizeID("   ", "fallback"); got != "fallback" {
+		t.Fatalf("sanitizeID fallback = %q", got)
 	}
 }

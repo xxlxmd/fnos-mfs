@@ -90,6 +90,29 @@ type SetupPlan struct {
 
 type commandOutputFunc func(name string, args ...string) string
 
+type AppSelection struct {
+	App   AppConfig
+	Other bool
+}
+
+type StatusItem struct {
+	State  string
+	Label  string
+	Detail string
+}
+
+const (
+	statusOK      = "ok"
+	statusWarn    = "warn"
+	statusFail    = "fail"
+	colorReset    = "\033[0m"
+	colorGreen    = "\033[32m"
+	colorYellow   = "\033[33m"
+	colorRed      = "\033[31m"
+	customAppID   = "other"
+	customAppName = "Other"
+)
+
 func main() {
 	if len(os.Args) > 1 {
 		fmt.Println("fnos-mfs 是交互式工具，不需要参数。直接运行：fnos-mfs")
@@ -109,13 +132,32 @@ func main() {
 	fmt.Println("交互式 mergerfs 配置工具")
 	fmt.Println()
 
-	app, err := chooseApp(reader, cfg.Apps)
+	selection, err := chooseApp(reader, cfg.Apps)
 	if err != nil {
 		exitErr(err)
 	}
+	app := selection.App
 
+	if !selection.Other {
+		printAppDashboard(app)
+	}
+
+	if selection.Other {
+		app, err = promptCustomApp(reader)
+		if err != nil {
+			exitErr(err)
+		}
+	}
+
+	err = runActionMenu(reader, app)
+	if err != nil {
+		exitErr(err)
+	}
+}
+
+func runActionMenu(reader *bufio.Reader, app AppConfig) error {
 	action, err := chooseOne(reader, "选择操作", []string{
-		"set - 配置 MFS 聚合目录",
+		"set - 配置/修改 MFS 聚合目录",
 		"discover - 发现当前 /vol 卷",
 		"acl - 给当前 App 补权限",
 		"status - 查看当前 App 状态",
@@ -138,11 +180,9 @@ func main() {
 	case strings.HasPrefix(action, "install"):
 		err = runInstall(reader)
 	case strings.HasPrefix(action, "exit"):
-		return
+		return nil
 	}
-	if err != nil {
-		exitErr(err)
-	}
+	return err
 }
 
 func loadConfig() (Config, error) {
@@ -190,21 +230,63 @@ func validateConfig(cfg Config) error {
 	return nil
 }
 
-func chooseApp(reader *bufio.Reader, apps []AppConfig) (AppConfig, error) {
-	labels := make([]string, 0, len(apps))
+func chooseApp(reader *bufio.Reader, apps []AppConfig) (AppSelection, error) {
+	labels := make([]string, 0, len(apps)+1)
 	for _, app := range apps {
 		labels = append(labels, fmt.Sprintf("%s - %s", app.ID, app.Label))
 	}
+	labels = append(labels, "other - 自定义 App")
 	chosen, err := chooseOne(reader, "选择 App", labels)
 	if err != nil {
-		return AppConfig{}, err
+		return AppSelection{}, err
 	}
 	for i, label := range labels {
 		if label == chosen {
-			return apps[i], nil
+			if i == len(apps) {
+				return AppSelection{Other: true}, nil
+			}
+			return AppSelection{App: apps[i]}, nil
 		}
 	}
-	return AppConfig{}, errors.New("未选择 App")
+	return AppSelection{}, errors.New("未选择 App")
+}
+
+func promptCustomApp(reader *bufio.Reader) (AppConfig, error) {
+	fmt.Println()
+	fmt.Println("自定义 App")
+	id, err := promptDefault(reader, "App ID", customAppID)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	label, err := promptDefault(reader, "显示名称", customAppName)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	userName, err := promptDefault(reader, "App Linux 用户名", "")
+	if err != nil {
+		return AppConfig{}, err
+	}
+	poolName, err := promptDefault(reader, "默认底层目录名", ".mfs_pool")
+	if err != nil {
+		return AppConfig{}, err
+	}
+	mountDir, err := promptDefault(reader, "默认聚合入口目录名", "聚合目录")
+	if err != nil {
+		return AppConfig{}, err
+	}
+	var candidates []string
+	if userName != "" {
+		candidates = []string{userName}
+	}
+	return AppConfig{
+		ID:              sanitizeID(id, customAppID),
+		Label:           label,
+		DefaultPoolName: poolName,
+		DefaultMountDir: mountDir,
+		PathTemplate:    "{primary}/{home}/{mount_dir}",
+		UserCandidates:  candidates,
+		ServiceName:     "fnos-mfs-" + sanitizeID(id, customAppID),
+	}, nil
 }
 
 func runSet(reader *bufio.Reader, app AppConfig) error {
@@ -230,7 +312,7 @@ func runSet(reader *bufio.Reader, app AppConfig) error {
 		return err
 	}
 
-	appUser := resolveAppUser(app)
+	appUser, _ := defaultAppUser(app)
 	if appUser == "" {
 		appUser, err = promptDefault(reader, "没有自动找到 App 用户，请输入真实 Linux 用户名", "")
 		if err != nil {
@@ -249,6 +331,10 @@ func runSet(reader *bufio.Reader, app AppConfig) error {
 	}
 
 	plan := buildSetupPlan(app, appUser, owner, poolName, mountPoint, selectedVolumes)
+	plan, err = maybeCustomizePlan(reader, plan)
+	if err != nil {
+		return err
+	}
 	printPlan(plan)
 	ok, err := confirm(reader, "确认执行 set")
 	if err != nil || !ok {
@@ -279,6 +365,109 @@ func runDiscover() error {
 	}
 	printVolumes(volumes)
 	return nil
+}
+
+func printAppDashboard(app AppConfig) {
+	fmt.Println("当前 App 状态:")
+	for _, item := range collectAppStatus(app) {
+		fmt.Println("  " + renderStatusItem(item))
+	}
+	volumes, err := discoverVolumes()
+	if err != nil {
+		fmt.Println("  " + renderStatusItem(StatusItem{State: statusFail, Label: "卷发现", Detail: err.Error()}))
+		fmt.Println()
+		return
+	}
+	if len(volumes) == 0 {
+		fmt.Println("  " + renderStatusItem(StatusItem{State: statusWarn, Label: "可用卷", Detail: "没有发现 /vol1 /vol2 这类卷"}))
+		fmt.Println()
+		return
+	}
+	fmt.Println("  " + renderStatusItem(StatusItem{State: statusOK, Label: "可用卷", Detail: fmt.Sprintf("%d 个", len(volumes))}))
+	for _, vol := range volumes {
+		fmt.Printf("    - %s device=%s uuid=%s\n", vol.Path, emptyDash(vol.Device), emptyDash(vol.UUID))
+	}
+	fmt.Println()
+}
+
+func collectAppStatus(app AppConfig) []StatusItem {
+	items := []StatusItem{
+		{State: statusOK, Label: "预设", Detail: fmt.Sprintf("%s (%s)", app.ID, app.Label)},
+		{State: statusOK, Label: "默认底层目录", Detail: app.DefaultPoolName},
+		{State: statusOK, Label: "默认聚合入口名", Detail: app.DefaultMountDir},
+	}
+	if appUser, ok := appUserStatus(app); ok {
+		items = append(items, StatusItem{State: statusOK, Label: "App 用户", Detail: appUser})
+	} else if len(app.UserCandidates) > 0 {
+		items = append(items, StatusItem{State: statusFail, Label: "App 用户", Detail: "未找到，候选: " + strings.Join(app.UserCandidates, ", ")})
+	} else {
+		items = append(items, StatusItem{State: statusWarn, Label: "App 用户", Detail: "没有配置候选用户"})
+	}
+	items = append(items, dependencyStatusItems(exec.LookPath)...)
+	if state, err := loadState(app); err == nil {
+		items = append(items, StatusItem{State: statusOK, Label: "已保存配置", Detail: state.MountPoint})
+		if active := commandOutput("systemctl", "is-active", state.ServiceName+".service"); active == "active" {
+			items = append(items, StatusItem{State: statusOK, Label: "systemd", Detail: state.ServiceName + ".service active"})
+		} else if active != "" {
+			items = append(items, StatusItem{State: statusWarn, Label: "systemd", Detail: state.ServiceName + ".service " + active})
+		} else {
+			items = append(items, StatusItem{State: statusWarn, Label: "systemd", Detail: "当前环境无法读取或服务未创建"})
+		}
+	} else {
+		items = append(items, StatusItem{State: statusWarn, Label: "已保存配置", Detail: "未找到，执行 set 后生成"})
+	}
+	return items
+}
+
+func dependencyStatusItems(lookPath func(string) (string, error)) []StatusItem {
+	checks := []struct {
+		label    string
+		commands []string
+	}{
+		{label: "mergerfs", commands: []string{"mergerfs"}},
+		{label: "fuse3", commands: []string{"fusermount3"}},
+		{label: "acl", commands: []string{"setfacl", "getfacl"}},
+	}
+	items := make([]StatusItem, 0, len(checks))
+	for _, check := range checks {
+		var missing []string
+		for _, command := range check.commands {
+			if _, err := lookPath(command); err != nil {
+				missing = append(missing, command)
+			}
+		}
+		if len(missing) == 0 {
+			items = append(items, StatusItem{State: statusOK, Label: check.label, Detail: "已安装"})
+		} else {
+			items = append(items, StatusItem{State: statusFail, Label: check.label, Detail: "未安装/未找到: " + strings.Join(missing, ", ")})
+		}
+	}
+	return items
+}
+
+func renderStatusItem(item StatusItem) string {
+	prefix := "?"
+	color := colorYellow
+	switch item.State {
+	case statusOK:
+		prefix = "OK"
+		color = colorGreen
+	case statusFail:
+		prefix = "NO"
+		color = colorRed
+	case statusWarn:
+		prefix = "--"
+		color = colorYellow
+	}
+	text := fmt.Sprintf("[%s] %s: %s", prefix, item.Label, item.Detail)
+	return colorize(color, text)
+}
+
+func colorize(color string, text string) string {
+	if os.Getenv("NO_COLOR") != "" {
+		return text
+	}
+	return color + text + colorReset
 }
 
 func runACL(reader *bufio.Reader, app AppConfig) error {
@@ -313,8 +502,10 @@ func runACL(reader *bufio.Reader, app AppConfig) error {
 func runStatus(app AppConfig) error {
 	state, err := loadState(app)
 	if err != nil {
-		return err
+		printAppDashboard(app)
+		return nil
 	}
+	printAppDashboard(app)
 	fmt.Println()
 	fmt.Printf("App: %s (%s)\n", state.AppID, state.AppLabel)
 	fmt.Printf("App 用户: %s\n", emptyDash(state.AppUser))
@@ -509,13 +700,52 @@ func chooseVolumes(reader *bufio.Reader, volumes []Volume) ([]Volume, error) {
 }
 
 func resolveAppUser(app AppConfig) string {
-	for _, candidate := range app.UserCandidates {
-		if _, err := user.Lookup(candidate); err == nil {
-			fmt.Printf("自动获取 App 用户: %s\n", candidate)
-			return candidate
-		}
+	appUser, ok := appUserStatus(app)
+	if ok {
+		fmt.Printf("自动获取 App 用户: %s\n", appUser)
+		return appUser
 	}
 	return ""
+}
+
+func appUserStatus(app AppConfig) (string, bool) {
+	for _, candidate := range app.UserCandidates {
+		if _, err := user.Lookup(candidate); err == nil {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func defaultAppUser(app AppConfig) (string, bool) {
+	if appUser, ok := appUserStatus(app); ok {
+		fmt.Printf("自动获取 App 用户: %s\n", appUser)
+		return appUser, true
+	}
+	if len(app.UserCandidates) > 0 {
+		return app.UserCandidates[0], false
+	}
+	return "", false
+}
+
+func maybeCustomizePlan(reader *bufio.Reader, plan SetupPlan) (SetupPlan, error) {
+	ok, err := confirm(reader, "是否修改 appuser/name/path 等其他选项")
+	if err != nil || !ok {
+		return plan, err
+	}
+	appUser, err := promptDefault(reader, "App 用户", plan.AppUser)
+	if err != nil {
+		return plan, err
+	}
+	poolName, err := promptDefault(reader, "底层目录名", plan.PoolName)
+	if err != nil {
+		return plan, err
+	}
+	mountPoint, err := promptDefault(reader, "聚合入口路径", plan.MountPoint)
+	if err != nil {
+		return plan, err
+	}
+	return buildSetupPlan(plan.App, appUser, plan.Owner, poolName, mountPoint, plan.Volumes), nil
 }
 
 func buildSetupPlan(app AppConfig, appUser string, owner OwnerCandidate, poolName string, mountPoint string, volumes []Volume) SetupPlan {
@@ -1037,6 +1267,29 @@ func emptyDash(value string) string {
 		return "-"
 	}
 	return value
+}
+
+func sanitizeID(value string, fallback string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if valid {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteRune('-')
+			lastDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return fallback
+	}
+	return out
 }
 
 func exitErr(err error) {

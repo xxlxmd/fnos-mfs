@@ -11,7 +11,7 @@ sudo fnos-mfs
 然后按提示选择：
 
 ```text
-1. App：fnvideo / fnmusic / fnxunlei / fnaria2
+1. App：fnvideo / fnmusic / fnxunlei / fnaria2 / other
 2. 操作：set / discover / acl / status / install
 3. set 时从系统发现 /vol1 /vol2 /vol3
 4. 用复选输入选择参与聚合的卷
@@ -28,7 +28,30 @@ fnvideo
 fnmusic
 fnxunlei
 fnaria2
+other
 ```
+
+选内置 App 后，会先显示状态面板：
+
+```text
+App 用户是否存在
+默认底层目录名
+默认聚合入口名
+mergerfs/fuse3/acl 安装状态
+已保存配置
+systemd 状态
+当前发现的 /volX 卷
+```
+
+状态用颜色区分：
+
+```text
+绿色  正常
+黄色  未配置或当前环境无法确认
+红色  缺失或未安装
+```
+
+`other` 是自定义 App。选择后会让你输入 App ID、显示名称、App Linux 用户名、默认底层目录名和默认聚合目录名，然后进入普通操作菜单。
 
 第二步选择操作：
 
@@ -49,8 +72,9 @@ exit      退出
 3. 从 /volX/1000 这类目录推断 owner
 4. 按 App 配置给出默认底层目录名
 5. 按 App 配置给出默认聚合入口路径
-6. 显示执行计划
-7. 输入 yes 后才真正创建目录、写 ACL、写 systemd、启动服务
+6. 可选修改 appuser/name/path
+7. 显示执行计划
+8. 输入 yes 后才真正创建目录、写 ACL、写 systemd、启动服务
 ```
 
 默认 mergerfs 策略：
@@ -84,6 +108,14 @@ fnvideo  -> 飞牛影视
 fnmusic  -> 飞牛音乐
 fnxunlei -> 飞牛迅雷
 fnaria2  -> Aria2
+```
+
+`fnvideo` 默认：
+
+```text
+底层目录名：.media_pool
+聚合入口名：影视聚合
+App 用户候选：trim.media, trim-media
 ```
 
 配置里主要有：
@@ -167,11 +199,14 @@ make check
 
 ```text
 App JSON 配置校验
+other 自定义 App
+App 状态渲染
 复选输入解析
 /volX 发现排序和元数据读取
 owner 推断
 默认路径渲染
 setup 计划生成
+可选覆盖 appuser/name/path
 ACL 父路径计算
 systemd service 渲染和路径转义
 ```
