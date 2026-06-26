@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -206,6 +207,22 @@ func TestFindUUIDWithCommandFallsBackToLsblk(t *testing.T) {
 	}
 }
 
+func TestHostStatusItems(t *testing.T) {
+	lookPath := func(command string) (string, error) {
+		if command == "apt" {
+			return "", os.ErrNotExist
+		}
+		return "/usr/bin/" + command, nil
+	}
+	items := hostStatusItems(lookPath, 1000)
+	if len(items) != 3 {
+		t.Fatalf("len = %d, want 3", len(items))
+	}
+	if items[0].State != statusWarn || items[1].State != statusOK || items[2].State != statusWarn {
+		t.Fatalf("unexpected host status: %+v", items)
+	}
+}
+
 func TestDiscoverOwnersCountsNumericHomeDirs(t *testing.T) {
 	root := t.TempDir()
 	vol1 := filepath.Join(root, "vol1")
@@ -249,6 +266,80 @@ func TestBuildSetupPlan(t *testing.T) {
 	}
 	if plan.MountPoint != "/vol2/1000/影视文件合集" {
 		t.Fatalf("mount point = %q", plan.MountPoint)
+	}
+}
+
+func TestSetupPlanChecksPassesValidPlan(t *testing.T) {
+	plan := SetupPlan{
+		AppUser:    "trim.media",
+		Owner:      OwnerCandidate{HomeName: "1000", UID: "1000", GID: "1000"},
+		PoolName:   ".media_pool",
+		MountPoint: "/vol1/1000/影视聚合",
+		Volumes: []Volume{
+			{Name: "vol1", Path: "/vol1", Device: "/dev/sda1", FSType: "ext4", UUID: "u1", MountState: "mounted"},
+			{Name: "vol2", Path: "/vol2", Device: "/dev/sdb1", FSType: "ext4", UUID: "u2", MountState: "mounted"},
+		},
+		Branches: []BranchState{
+			{VolumePath: "/vol1", BranchPath: "/vol1/1000/.media_pool"},
+			{VolumePath: "/vol2", BranchPath: "/vol2/1000/.media_pool"},
+		},
+	}
+	command := func(name string, args ...string) string { return "" }
+	lookup := func(username string) (*user.User, error) { return &user.User{Username: username}, nil }
+	checks := setupPlanChecks(plan, command, lookup)
+	if hasFailedStatus(checks) {
+		t.Fatalf("unexpected failed checks: %+v", checks)
+	}
+}
+
+func TestSetupPlanChecksFindsRiskyPlan(t *testing.T) {
+	plan := SetupPlan{
+		AppUser:    "missing.user",
+		Owner:      OwnerCandidate{HomeName: "1000"},
+		PoolName:   "bad/name",
+		MountPoint: "relative/path",
+		Volumes: []Volume{
+			{Name: "vol1", Path: "/vol1", MountState: "unmounted"},
+		},
+		Branches: []BranchState{
+			{VolumePath: "/vol1", BranchPath: "/vol1/1000/bad/name"},
+		},
+	}
+	command := func(name string, args ...string) string { return "" }
+	lookup := func(username string) (*user.User, error) { return nil, os.ErrNotExist }
+	checks := setupPlanChecks(plan, command, lookup)
+	if !hasFailedStatus(checks) {
+		t.Fatalf("expected failed checks: %+v", checks)
+	}
+	joined := statusItemsText(checks)
+	for _, want := range []string{"至少选择两个卷", "卷未挂载", "底层目录名无效", "聚合入口路径必须是绝对路径", "App 用户不存在"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("checks missing %q: %s", want, joined)
+		}
+	}
+}
+
+func TestSetupPlanChecksRejectsMountPointContainingBranch(t *testing.T) {
+	plan := SetupPlan{
+		AppUser:    "trim.media",
+		Owner:      OwnerCandidate{HomeName: "1000", UID: "1000", GID: "1000"},
+		PoolName:   ".media_pool",
+		MountPoint: "/vol1/1000",
+		Volumes: []Volume{
+			{Name: "vol1", Path: "/vol1", Device: "/dev/sda1", FSType: "ext4", UUID: "u1", MountState: "mounted"},
+			{Name: "vol2", Path: "/vol2", Device: "/dev/sdb1", FSType: "ext4", UUID: "u2", MountState: "mounted"},
+		},
+		Branches: []BranchState{
+			{VolumePath: "/vol1", BranchPath: "/vol1/1000/.media_pool"},
+			{VolumePath: "/vol2", BranchPath: "/vol2/1000/.media_pool"},
+		},
+	}
+	command := func(name string, args ...string) string { return "" }
+	lookup := func(username string) (*user.User, error) { return &user.User{Username: username}, nil }
+	checks := setupPlanChecks(plan, command, lookup)
+	joined := statusItemsText(checks)
+	if !strings.Contains(joined, "底层目录 /vol1/1000/.media_pool 在挂载入口 /vol1/1000 内") {
+		t.Fatalf("expected containing-path conflict: %+v", checks)
 	}
 }
 
@@ -318,6 +409,51 @@ func TestSystemdHelpers(t *testing.T) {
 	}
 }
 
+func TestParseConfirm(t *testing.T) {
+	for _, input := range []string{"yes", "YES", "y", " Y "} {
+		if !parseConfirm(input) {
+			t.Fatalf("expected %q to confirm", input)
+		}
+	}
+	for _, input := range []string{"", "no", "1"} {
+		if parseConfirm(input) {
+			t.Fatalf("expected %q to reject", input)
+		}
+	}
+}
+
+func TestStateStatusChecks(t *testing.T) {
+	root := t.TempDir()
+	branch := filepath.Join(root, "vol1", "1000", ".media_pool")
+	mount := filepath.Join(root, "vol1", "1000", "影视聚合")
+	if err := os.MkdirAll(branch, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(mount, 0755); err != nil {
+		t.Fatal(err)
+	}
+	state := AppState{
+		MountPoint: mount,
+		Branches: []BranchState{
+			{VolumePath: filepath.Join(root, "vol1"), BranchPath: branch},
+			{VolumePath: filepath.Join(root, "vol2"), BranchPath: filepath.Join(root, "vol2", "1000", ".media_pool")},
+		},
+	}
+	checks := stateStatusChecks(state)
+	joined := statusItemsText(checks)
+	if !strings.Contains(joined, "底层目录不存在") || !strings.Contains(joined, "卷路径不存在") {
+		t.Fatalf("expected missing path checks: %+v", checks)
+	}
+}
+
+func statusItemsText(items []StatusItem) string {
+	var parts []string
+	for _, item := range items {
+		parts = append(parts, item.Label+": "+item.Detail)
+	}
+	return strings.Join(parts, "\n")
+}
+
 func TestDependencyStatusItems(t *testing.T) {
 	lookPath := func(command string) (string, error) {
 		if command == "getfacl" {
@@ -346,6 +482,7 @@ func TestRepairSuggestions(t *testing.T) {
 		{name: "root", err: errors.New("需要 root 权限，请用 sudo fnos-mfs 运行"), want: "sudo ./fnos-mfs"},
 		{name: "volumes", err: errors.New("没有发现 /vol1 /vol2 这类卷"), want: "findmnt | grep /vol"},
 		{name: "dependencies", err: errDependencyInstallDeclined, want: "apt install -y mergerfs fuse3 acl"},
+		{name: "preflight", err: errSetupPreflightFailed, want: "预检结果"},
 		{name: "app user", err: errors.New("App 用户为空，不能补 ACL"), want: "真实 App Linux 用户名"},
 		{name: "acl", err: errors.New("setfacl -m u:trim.media:--x /vol1: exit status 1"), want: "id <appuser>"},
 		{name: "systemd", err: errors.New("systemctl restart fnos-mfs-fnvideo.service: exit status 1"), want: "journalctl -u <service>"},

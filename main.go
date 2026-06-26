@@ -90,6 +90,7 @@ type SetupPlan struct {
 }
 
 type commandOutputFunc func(name string, args ...string) string
+type userLookupFunc func(username string) (*user.User, error)
 
 type AppSelection struct {
 	App   AppConfig
@@ -115,6 +116,7 @@ const (
 )
 
 var errDependencyInstallDeclined = errors.New("缺少依赖，已取消安装")
+var errSetupPreflightFailed = errors.New("set 预检失败，请先处理红色项目")
 
 func main() {
 	if len(os.Args) > 1 {
@@ -347,6 +349,11 @@ func runSet(reader *bufio.Reader, app AppConfig) error {
 		return err
 	}
 	printPlan(plan)
+	checks := setupPlanChecks(plan, commandOutput, user.Lookup)
+	printStatusList("预检结果:", checks)
+	if hasFailedStatus(checks) {
+		return errSetupPreflightFailed
+	}
 	ok, err := confirm(reader, "确认执行 set")
 	if err != nil || !ok {
 		return err
@@ -407,6 +414,7 @@ func collectAppStatus(app AppConfig) []StatusItem {
 		{State: statusOK, Label: "默认底层目录", Detail: app.DefaultPoolName},
 		{State: statusOK, Label: "默认聚合入口名", Detail: app.DefaultMountDir},
 	}
+	items = append(items, hostStatusItems(exec.LookPath, os.Geteuid())...)
 	if appUser, ok := appUserStatus(app); ok {
 		items = append(items, StatusItem{State: statusOK, Label: "App 用户", Detail: appUser})
 	} else if len(app.UserCandidates) > 0 {
@@ -426,6 +434,26 @@ func collectAppStatus(app AppConfig) []StatusItem {
 		}
 	} else {
 		items = append(items, StatusItem{State: statusWarn, Label: "已保存配置", Detail: "未找到，执行 set 后生成"})
+	}
+	return items
+}
+
+func hostStatusItems(lookPath func(string) (string, error), euid int) []StatusItem {
+	items := make([]StatusItem, 0, 3)
+	if euid == 0 {
+		items = append(items, StatusItem{State: statusOK, Label: "Root 权限", Detail: "当前是 root"})
+	} else {
+		items = append(items, StatusItem{State: statusWarn, Label: "Root 权限", Detail: "set/install/acl 需要 sudo"})
+	}
+	if _, err := lookPath("systemctl"); err == nil {
+		items = append(items, StatusItem{State: statusOK, Label: "systemd", Detail: "可用"})
+	} else {
+		items = append(items, StatusItem{State: statusFail, Label: "systemd", Detail: "未找到 systemctl"})
+	}
+	if _, err := lookPath("apt"); err == nil {
+		items = append(items, StatusItem{State: statusOK, Label: "apt", Detail: "可用"})
+	} else {
+		items = append(items, StatusItem{State: statusWarn, Label: "apt", Detail: "未找到，install 不能自动安装依赖"})
 	}
 	return items
 }
@@ -529,6 +557,7 @@ func runStatus(app AppConfig) error {
 		fmt.Printf("- %s uuid=%s branch=%s\n", branch.VolumePath, emptyDash(branch.VolumeUUID), branch.BranchPath)
 	}
 	fmt.Println()
+	printStatusList("保存配置检查:", stateStatusChecks(state))
 	printCommand("systemctl", "is-active", state.ServiceName+".service")
 	printCommand("findmnt", state.MountPoint)
 	printCommand("df", "-hT", state.MountPoint)
@@ -537,8 +566,11 @@ func runStatus(app AppConfig) error {
 
 func runInstall(reader *bufio.Reader) error {
 	ok, err := confirm(reader, "确认安装 mergerfs fuse3 acl")
-	if err != nil || !ok {
+	if err != nil {
 		return err
+	}
+	if !ok {
+		return errDependencyInstallDeclined
 	}
 	if err := requireRoot(); err != nil {
 		return err
@@ -571,6 +603,8 @@ func discoverVolumesIn(root string, command commandOutputFunc) ([]Volume, error)
 		vol.UUID = findUUIDWithCommand(path, vol.Device, command)
 		if vol.Device != "" {
 			vol.MountState = "mounted"
+		} else {
+			vol.MountState = "unmounted"
 		}
 		volumes = append(volumes, vol)
 	}
@@ -772,6 +806,154 @@ func buildSetupPlan(app AppConfig, appUser string, owner OwnerCandidate, poolNam
 		App: app, AppUser: appUser, Owner: owner, PoolName: poolName,
 		MountPoint: mountPoint, Volumes: volumes, Branches: branches,
 	}
+}
+
+func setupPlanChecks(plan SetupPlan, command commandOutputFunc, lookupUser userLookupFunc) []StatusItem {
+	var checks []StatusItem
+	add := func(state string, label string, detail string) {
+		checks = append(checks, StatusItem{State: state, Label: label, Detail: detail})
+	}
+
+	if len(plan.Volumes) >= 2 {
+		add(statusOK, "卷数量", fmt.Sprintf("%d 个", len(plan.Volumes)))
+	} else {
+		add(statusFail, "卷数量", "至少选择两个卷")
+	}
+
+	seenVolumes := map[string]bool{}
+	for _, vol := range plan.Volumes {
+		if seenVolumes[vol.Path] {
+			add(statusFail, "重复卷", vol.Path)
+			continue
+		}
+		seenVolumes[vol.Path] = true
+		if vol.Device == "" || vol.MountState != "mounted" {
+			add(statusFail, "卷未挂载", fmt.Sprintf("%s device=%s", vol.Path, emptyDash(vol.Device)))
+			continue
+		}
+		detail := fmt.Sprintf("%s device=%s fstype=%s uuid=%s", vol.Path, emptyDash(vol.Device), emptyDash(vol.FSType), emptyDash(vol.UUID))
+		if vol.UUID == "" {
+			add(statusWarn, "卷 UUID", detail)
+		} else {
+			add(statusOK, "卷", detail)
+		}
+	}
+
+	if isValidPoolName(plan.PoolName) {
+		add(statusOK, "底层目录名", plan.PoolName)
+	} else {
+		add(statusFail, "底层目录名无效", plan.PoolName)
+	}
+
+	if filepath.IsAbs(plan.MountPoint) {
+		add(statusOK, "聚合入口路径", plan.MountPoint)
+	} else {
+		add(statusFail, "聚合入口路径必须是绝对路径", plan.MountPoint)
+	}
+
+	if plan.AppUser == "" {
+		add(statusFail, "App 用户", "为空")
+	} else if _, err := lookupUser(plan.AppUser); err == nil {
+		add(statusOK, "App 用户", plan.AppUser)
+	} else {
+		add(statusFail, "App 用户不存在", plan.AppUser)
+	}
+
+	if plan.Owner.HomeName == "" {
+		add(statusFail, "Owner home", "为空")
+	} else if plan.Owner.UID == "" || plan.Owner.GID == "" {
+		add(statusWarn, "Owner", fmt.Sprintf("home=%s uid=%s gid=%s", plan.Owner.HomeName, emptyDash(plan.Owner.UID), emptyDash(plan.Owner.GID)))
+	} else {
+		add(statusOK, "Owner", fmt.Sprintf("home=%s uid=%s gid=%s", plan.Owner.HomeName, plan.Owner.UID, plan.Owner.GID))
+	}
+
+	seenBranches := map[string]bool{}
+	for _, branch := range plan.Branches {
+		if seenBranches[branch.BranchPath] {
+			add(statusFail, "重复分支目录", branch.BranchPath)
+			continue
+		}
+		seenBranches[branch.BranchPath] = true
+		if samePath(branch.BranchPath, plan.MountPoint) || pathInside(plan.MountPoint, branch.BranchPath) {
+			add(statusFail, "挂载入口冲突", fmt.Sprintf("%s 在底层目录 %s 内", plan.MountPoint, branch.BranchPath))
+		} else if pathInside(branch.BranchPath, plan.MountPoint) {
+			add(statusFail, "挂载入口冲突", fmt.Sprintf("底层目录 %s 在挂载入口 %s 内", branch.BranchPath, plan.MountPoint))
+		}
+	}
+
+	if source := command("findmnt", "-no", "SOURCE", plan.MountPoint); source != "" {
+		add(statusWarn, "挂载入口已挂载", fmt.Sprintf("%s source=%s", plan.MountPoint, source))
+	}
+
+	return checks
+}
+
+func stateStatusChecks(state AppState) []StatusItem {
+	var checks []StatusItem
+	add := func(status string, label string, detail string) {
+		checks = append(checks, StatusItem{State: status, Label: label, Detail: detail})
+	}
+	if state.MountPoint == "" {
+		add(statusFail, "聚合入口", "为空")
+	} else if _, err := os.Stat(state.MountPoint); err == nil {
+		add(statusOK, "聚合入口", state.MountPoint)
+	} else {
+		add(statusFail, "聚合入口不存在", state.MountPoint)
+	}
+	for _, branch := range state.Branches {
+		if _, err := os.Stat(branch.BranchPath); err == nil {
+			add(statusOK, "底层目录", branch.BranchPath)
+		} else {
+			add(statusFail, "底层目录不存在", branch.BranchPath)
+		}
+		if branch.VolumePath == "" {
+			add(statusFail, "卷路径", "为空")
+		} else if _, err := os.Stat(branch.VolumePath); err == nil {
+			add(statusOK, "卷路径", branch.VolumePath)
+		} else {
+			add(statusFail, "卷路径不存在", branch.VolumePath)
+		}
+	}
+	return checks
+}
+
+func isValidPoolName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	return !strings.ContainsRune(name, os.PathSeparator)
+}
+
+func hasFailedStatus(items []StatusItem) bool {
+	for _, item := range items {
+		if item.State == statusFail {
+			return true
+		}
+	}
+	return false
+}
+
+func printStatusList(title string, items []StatusItem) {
+	fmt.Println(title)
+	for _, item := range items {
+		fmt.Println("  " + renderStatusItem(item))
+	}
+	fmt.Println()
+}
+
+func samePath(a string, b string) bool {
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+func pathInside(path string, parent string) bool {
+	path = filepath.Clean(path)
+	parent = filepath.Clean(parent)
+	rel, err := filepath.Rel(parent, path)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
 func applySetup(plan SetupPlan) error {
@@ -1085,7 +1267,7 @@ func printVolumes(volumes []Volume) {
 	fmt.Println()
 	fmt.Println("发现卷：")
 	for _, vol := range volumes {
-		fmt.Printf("- %s device=%s fstype=%s uuid=%s\n", vol.Path, emptyDash(vol.Device), emptyDash(vol.FSType), emptyDash(vol.UUID))
+		fmt.Printf("- %s status=%s device=%s fstype=%s uuid=%s\n", vol.Path, emptyDash(vol.MountState), emptyDash(vol.Device), emptyDash(vol.FSType), emptyDash(vol.UUID))
 	}
 	fmt.Println()
 }
@@ -1208,11 +1390,20 @@ func promptDefault(reader *bufio.Reader, label string, def string) (string, erro
 }
 
 func confirm(reader *bufio.Reader, label string) (bool, error) {
-	input, err := prompt(reader, label+"? 输入 yes 确认")
+	input, err := prompt(reader, label+"? 输入 yes/y 确认")
 	if err != nil {
 		return false, err
 	}
-	return input == "yes", nil
+	return parseConfirm(input), nil
+}
+
+func parseConfirm(input string) bool {
+	switch strings.ToLower(strings.TrimSpace(input)) {
+	case "yes", "y":
+		return true
+	default:
+		return false
+	}
 }
 
 func prompt(reader *bufio.Reader, label string) (string, error) {
@@ -1234,7 +1425,7 @@ func renderPathTemplate(template string, primary string, home string, mountDir s
 }
 
 func volumeLabel(vol Volume) string {
-	return fmt.Sprintf("%s device=%s fstype=%s uuid=%s", vol.Path, emptyDash(vol.Device), emptyDash(vol.FSType), emptyDash(vol.UUID))
+	return fmt.Sprintf("%s status=%s device=%s fstype=%s uuid=%s", vol.Path, emptyDash(vol.MountState), emptyDash(vol.Device), emptyDash(vol.FSType), emptyDash(vol.UUID))
 }
 
 func naturalVolLess(a string, b string) bool {
@@ -1351,6 +1542,9 @@ func repairSuggestions(err error) []string {
 		add("可用命令检查：ls -ld /vol* && findmnt | grep /vol")
 	case strings.Contains(msg, "set 至少选择两个卷"):
 		add("set 做聚合至少选两个卷，例如选择 1,2 或 2,3,4。")
+	case errors.Is(err, errSetupPreflightFailed):
+		add("按预检结果先处理红色项目，再重新执行 set。")
+		add("常见处理：安装依赖、确认 /volX 已挂载、确认 App 用户存在。")
 	case strings.Contains(msg, "没有找到") && strings.Contains(msg, "状态文件"):
 		add("先执行 set 生成 /etc/fnos-mfs/<app>.json。")
 	case errors.Is(err, errDependencyInstallDeclined):
@@ -1362,6 +1556,13 @@ func repairSuggestions(err error) []string {
 	case strings.Contains(msg, "创建底层目录失败") || strings.Contains(msg, "创建聚合入口失败"):
 		add("确认所选 /volX 已挂载，且 home 目录存在，例如 /vol1/1000。")
 		add("确认用 sudo/root 运行。")
+	case strings.Contains(msg, "卷未挂载"):
+		add("先在 fnOS 存储空间页面确认每块盘都是单独 Basic 存储空间。")
+		add("再用 discover 确认 /volX 有 device/fstype/uuid。")
+	case strings.Contains(msg, "底层目录名无效"):
+		add("底层目录名只能是单个目录名，例如 .media_pool，不能包含 /。")
+	case strings.Contains(msg, "聚合入口路径必须是绝对路径"):
+		add("聚合入口应类似 /vol1/1000/影视聚合。")
 	case strings.Contains(msg, "setfacl"):
 		add("确认 acl 已安装：apt install -y acl")
 		add("确认 App 用户存在：id <appuser>")

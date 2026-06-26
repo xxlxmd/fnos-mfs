@@ -1,27 +1,70 @@
 # fnos-mfs
 
-`fnos-mfs` 是给 fnOS 上的 mergerfs 媒体目录准备的交互式命令行工具。
+English | [中文](README-cn.md)
 
-它不走一堆参数。直接运行：
+`fnos-mfs` is an interactive CLI for building app-friendly mergerfs media directories on fnOS.
+
+It is designed for a simple storage model: keep every physical disk as its own fnOS Basic storage space, then expose one merged directory to apps such as fnOS Video, fnOS Music, Xunlei, or Aria2.
+
+Run it without flags:
 
 ```bash
 sudo fnos-mfs
 ```
 
-然后按提示选择：
+## Storage Philosophy
+
+The intended model is:
 
 ```text
-1. App：fnvideo / fnmusic / fnxunlei / fnaria2 / other
-2. 操作：set / discover / acl / status / install
-3. set 时从系统发现 /vol1 /vol2 /vol3
-4. 用复选输入选择参与聚合的卷
-5. 自动从 /volX/1000 这类目录推断 owner
-6. 自动按 App 配置推断默认底层目录名和聚合入口路径
+Disk A -> fnOS Basic storage space -> /vol1
+Disk B -> fnOS Basic storage space -> /vol2
+Disk C -> fnOS Basic storage space -> /vol3
+
+/vol1/1000/.media_pool
+/vol2/1000/.media_pool
+/vol3/1000/.media_pool
+        |
+        v
+/vol1/1000/影视聚合
 ```
 
-## 当前流程
+`fnos-mfs` does not try to replace fnOS storage management. It assumes fnOS has already created and mounted each disk as a separate Basic storage space.
 
-启动后的第一步固定是选择 App：
+The tool then:
+
+```text
+1. discovers /vol1, /vol2, /vol3...
+2. creates a hidden branch directory on each selected volume
+3. mounts those branch directories into one visible app directory
+4. grants the selected app user access to both the visible mount and the hidden branches
+5. writes a systemd service so the merge survives reboot
+```
+
+Why this model:
+
+```text
+Each disk remains independently readable
+No RAID/JBOD coupling
+One disk failure does not make all disks unreadable
+Apps see one clean library path
+Cold media disks can still sleep when apps do not scan them
+```
+
+What it is not:
+
+```text
+It is not backup
+It is not RAID
+It does not duplicate files across disks
+It does not make different disks as safe as replicated storage
+```
+
+By default, new files use mergerfs `category.create=mfs`, meaning new files are created on the selected disk with the most free space.
+
+## Interactive Flow
+
+The first screen asks you to choose an app:
 
 ```text
 fnvideo
@@ -31,53 +74,113 @@ fnaria2
 other
 ```
 
-选内置 App 后，会先显示状态面板：
+For built-in apps, the tool shows a status dashboard before the action menu:
 
 ```text
-App 用户是否存在
-默认底层目录名
-默认聚合入口名
-mergerfs/fuse3/acl 安装状态
-已保存配置
-systemd 状态
-当前发现的 /volX 卷
+App user existence
+Default branch directory name
+Default merged mount name
+root/systemd/apt status
+mergerfs/fuse3/acl installation status
+saved fnos-mfs config
+systemd service state
+discovered /volX volumes
 ```
 
-状态用颜色区分：
+Colors:
 
 ```text
-绿色  正常
-黄色  未配置或当前环境无法确认
-红色  缺失或未安装
+green   OK
+yellow  warning or not configured
+red     missing or unsafe
 ```
 
-`other` 是自定义 App。选择后会让你输入 App ID、显示名称、App Linux 用户名、默认底层目录名和默认聚合目录名，然后进入普通操作菜单。
-
-第二步选择操作：
+Then choose an action:
 
 ```text
-set       配置 MFS 聚合目录
-discover  只发现当前 /vol 卷
-acl       给当前 App 补 ACL
-status    查看当前 App 状态
-install   安装 mergerfs/fuse3/acl
-exit      退出
+set       create or update an MFS merge
+discover  show discovered /volX volumes
+acl       re-apply app ACL
+status    show saved config and runtime checks
+install   install mergerfs/fuse3/acl
+exit      quit
 ```
 
-`set` 会做这些事：
+The menu stays open after `status`, `discover`, or a failed `set`. It only exits when you choose `exit`.
+
+## Built-In App Presets
+
+The default app config is embedded from:
 
 ```text
-1. 发现 /vol1 /vol2 /vol3 这类卷
-2. 复选参与聚合的卷，输入格式是 1,2,3 或 all
-3. 从 /volX/1000 这类目录推断 owner
-4. 按 App 配置给出默认底层目录名
-5. 按 App 配置给出默认聚合入口路径
-6. 可选修改 appuser/name/path
-7. 显示执行计划
-8. 输入 yes 后才真正创建目录、写 ACL、写 systemd、启动服务
+configs/apps.json
 ```
 
-默认 mergerfs 策略：
+At runtime, it can be overridden by:
+
+```text
+/etc/fnos-mfs/apps.json
+```
+
+Built-in presets:
+
+```text
+fnvideo  -> fnOS Video
+fnmusic  -> fnOS Music
+fnxunlei -> fnOS Xunlei
+fnaria2  -> Aria2
+```
+
+`fnvideo` defaults:
+
+```text
+branch directory: .media_pool
+mount directory:  影视聚合
+app user candidates: trim.media, trim-media
+```
+
+Config fields:
+
+```text
+default_pool_name  hidden branch directory created on every selected volume
+default_mount_dir  visible merged directory name
+path_template      default mount path template
+user_candidates    Linux app user candidates
+service_name       systemd service name
+```
+
+JSON is used instead of YAML so the Go binary can stay dependency-free.
+
+## What `set` Does
+
+`set` is the main workflow:
+
+```text
+1. discover /vol1 /vol2 /vol3...
+2. select the volumes to merge, for example 1,2,3 or all
+3. infer owner from /volX/1000-style home directories
+4. infer the default app user from the selected preset
+5. propose default branch and mount paths
+6. optionally edit app user, branch directory name, or mount path
+7. show the execution plan
+8. run preflight checks
+9. only apply changes after you type yes or y
+```
+
+Preflight checks catch common mistakes before touching the system:
+
+```text
+selected volume count
+whether selected /volX paths are mounted
+duplicate volume or branch paths
+valid branch directory name
+absolute mount path
+app user existence
+owner UID/GID availability
+mount point conflicts with branch directories
+```
+
+Default mergerfs options:
 
 ```text
 category.create=mfs
@@ -87,52 +190,9 @@ allow_other
 umask=000
 ```
 
-## 配置
+## Files Written
 
-默认 App 配置在：
-
-```text
-configs/apps.json
-```
-
-运行时可以用下面的文件覆盖内置配置：
-
-```text
-/etc/fnos-mfs/apps.json
-```
-
-当前内置 App：
-
-```text
-fnvideo  -> 飞牛影视
-fnmusic  -> 飞牛音乐
-fnxunlei -> 飞牛迅雷
-fnaria2  -> Aria2
-```
-
-`fnvideo` 默认：
-
-```text
-底层目录名：.media_pool
-聚合入口名：影视聚合
-App 用户候选：trim.media, trim-media
-```
-
-配置里主要有：
-
-```text
-default_pool_name  每个卷下面创建的隐藏底层目录
-default_mount_dir  聚合入口目录名
-path_template      默认入口路径模板
-user_candidates    App Linux 用户候选名
-service_name       systemd 服务名
-```
-
-这里用 JSON，不用 YAML。原因是 Go 标准库可以直接读 JSON，最后可以编译成单文件工具，不需要额外依赖。
-
-## 写入位置
-
-工具会写这些系统位置：
+System files:
 
 ```text
 /etc/fnos-mfs/<app>.json
@@ -140,142 +200,122 @@ service_name       systemd 服务名
 /etc/fuse.conf
 ```
 
-会修改这些目录：
+Storage paths:
 
 ```text
-每个选中卷的 /volX/<home>/<pool_name>
-聚合入口路径，比如 /vol1/1000/影视文件合集
+/volX/<home>/<pool_name>
+merged mount path, for example /vol1/1000/影视聚合
 ```
 
-`acl` 会给 App 用户补：
+ACL policy:
 
 ```text
-父目录 --x
-入口目录 rwx + default rwx
-底层目录 rwx + default rwx
+parent directories: --x
+visible mount path: rwx + default rwx
+hidden branch paths: rwx + default rwx
 ```
 
-## 错误处理
+## Error Handling
 
-菜单会持续运行。`status`、`discover` 或一次失败的 `set` 不会直接退出，只有选择 `exit` 才退出。
-
-遇到错误时，工具会输出：
+Errors include repair hints:
 
 ```text
-错误: 具体失败原因
+错误: concrete failure
 修复建议:
- - 下一步处理方式
+ - next step
 ```
 
-常见情况：
+Common fixes:
 
-```text
-没有发现 /vol1 /vol2
-先确认 fnOS 存储空间已挂载：
+```bash
+# no /volX discovered
 ls -ld /vol*
 findmnt | grep /vol
 
-需要 root 权限
-用 sudo 运行：
-sudo ./fnos-mfs
-
-缺少依赖
-在工具里选 install，或手动执行：
+# missing dependencies
 apt update && apt install -y mergerfs fuse3 acl
 
-ACL 失败
-确认 App 用户存在：
+# app user missing
 id <appuser>
 
-systemd 启动失败
-查看状态和日志：
+# systemd failure
 systemctl status <service> --no-pager
 journalctl -u <service> -n 100 --no-pager
 ```
 
-## Release
-
-仓库包含一个手动触发的 prerelease workflow：
-
-```text
-.github/workflows/prerelease.yml
-```
-
-在 GitHub Actions 里运行 `Prerelease`，输入 tag，比如：
-
-```text
-v0.1.0-dev
-```
-
-workflow 会执行：
-
-```text
-go test ./...
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build
-创建或更新 GitHub prerelease
-上传 dist/fnos-mfs-linux-amd64
-```
-
-## 免责声明
-
-本工具会修改系统挂载、ACL、FUSE 和 systemd 配置。使用前请自行确认数据备份和命令影响。作者不对数据丢失、服务中断或系统配置损坏负责。
-
-## License
-
-MIT License. See [LICENSE](LICENSE).
-
-## 构建
+## Build
 
 ```bash
 go build -o fnos-mfs .
 ```
 
-或者：
+or:
 
 ```bash
 make build
 ```
 
-给常见 x86 fnOS 主机打包：
+Build a Linux amd64 binary for common x86 fnOS hosts:
 
 ```bash
 make linux-amd64
 ```
 
-拷到 fnOS 后：
+Copy to fnOS and run:
 
 ```bash
 chmod +x fnos-mfs
 sudo ./fnos-mfs
 ```
 
-## 测试
-
-本机开发时运行：
+## Test
 
 ```bash
 go test ./...
 go build -o fnos-mfs .
 ```
 
-或者：
+or:
 
 ```bash
 make check
 ```
 
-单元测试覆盖：
+Tests cover:
 
 ```text
-App JSON 配置校验
-other 自定义 App
-App 状态渲染
-复选输入解析
-/volX 发现排序和元数据读取
-owner 推断
-默认路径渲染
-setup 计划生成
-可选覆盖 appuser/name/path
-ACL 父路径计算
-systemd service 渲染和路径转义
+app JSON validation
+custom app flow
+status rendering
+selection parsing
+/volX discovery
+owner inference
+setup plan checks
+path rendering
+systemd unit rendering
+error repair hints
 ```
+
+## Release
+
+The repository includes a manual prerelease workflow:
+
+```text
+.github/workflows/prerelease.yml
+```
+
+Run `Prerelease` in GitHub Actions with a tag such as:
+
+```text
+v0.1.0-dev
+```
+
+The workflow runs tests, builds `fnos-mfs-linux-amd64`, and creates or updates a GitHub prerelease.
+
+## Disclaimer
+
+This tool modifies system mounts, ACLs, FUSE, and systemd configuration. Review the execution plan, keep backups, and test on non-critical data first. The authors are not responsible for data loss, service interruption, or system configuration damage.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
