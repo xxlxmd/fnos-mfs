@@ -862,7 +862,7 @@ func setupPlanChecks(plan SetupPlan, command commandOutputFunc, lookupUser userL
 	if plan.Owner.HomeName == "" {
 		add(statusFail, "Owner home", "为空")
 	} else if plan.Owner.UID == "" || plan.Owner.GID == "" {
-		add(statusWarn, "Owner", fmt.Sprintf("home=%s uid=%s gid=%s", plan.Owner.HomeName, emptyDash(plan.Owner.UID), emptyDash(plan.Owner.GID)))
+		add(statusFail, "Owner UID/GID 缺失", fmt.Sprintf("home=%s uid=%s gid=%s", plan.Owner.HomeName, emptyDash(plan.Owner.UID), emptyDash(plan.Owner.GID)))
 	} else {
 		add(statusOK, "Owner", fmt.Sprintf("home=%s uid=%s gid=%s", plan.Owner.HomeName, plan.Owner.UID, plan.Owner.GID))
 	}
@@ -882,7 +882,7 @@ func setupPlanChecks(plan SetupPlan, command commandOutputFunc, lookupUser userL
 	}
 
 	if source := command("findmnt", "-no", "SOURCE", plan.MountPoint); source != "" {
-		add(statusWarn, "挂载入口已挂载", fmt.Sprintf("%s source=%s", plan.MountPoint, source))
+		add(statusFail, "挂载入口已挂载", fmt.Sprintf("%s source=%s", plan.MountPoint, source))
 	}
 
 	return checks
@@ -922,7 +922,7 @@ func isValidPoolName(name string) bool {
 	if name == "" || name == "." || name == ".." {
 		return false
 	}
-	return !strings.ContainsRune(name, os.PathSeparator)
+	return !strings.ContainsAny(name, string(os.PathSeparator)+":")
 }
 
 func hasFailedStatus(items []StatusItem) bool {
@@ -1560,9 +1560,15 @@ func repairSuggestions(err error) []string {
 		add("先在 fnOS 存储空间页面确认每块盘都是单独 Basic 存储空间。")
 		add("再用 discover 确认 /volX 有 device/fstype/uuid。")
 	case strings.Contains(msg, "底层目录名无效"):
-		add("底层目录名只能是单个目录名，例如 .media_pool，不能包含 /。")
+		add("底层目录名只能是单个目录名，例如 .media_pool，不能包含 / 或 :。")
 	case strings.Contains(msg, "聚合入口路径必须是绝对路径"):
 		add("聚合入口应类似 /vol1/1000/影视聚合。")
+	case strings.Contains(msg, "挂载入口已挂载"):
+		add("先确认该入口是否已被旧服务使用：findmnt <path>。")
+		add("如果是旧 MFS，请先停止并卸载对应 systemd 服务，再重新执行 set。")
+	case strings.Contains(msg, "Owner UID/GID 缺失"):
+		add("选择能在 /volX/<home> 上自动识别到 uid/gid 的 owner。")
+		add("如果没有自动识别，先确认 /volX/1000 这类 home 目录存在并有正确属主。")
 	case strings.Contains(msg, "setfacl"):
 		add("确认 acl 已安装：apt install -y acl")
 		add("确认 App 用户存在：id <appuser>")

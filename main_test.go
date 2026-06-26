@@ -312,7 +312,7 @@ func TestSetupPlanChecksFindsRiskyPlan(t *testing.T) {
 		t.Fatalf("expected failed checks: %+v", checks)
 	}
 	joined := statusItemsText(checks)
-	for _, want := range []string{"至少选择两个卷", "卷未挂载", "底层目录名无效", "聚合入口路径必须是绝对路径", "App 用户不存在"} {
+	for _, want := range []string{"至少选择两个卷", "卷未挂载", "底层目录名无效", "聚合入口路径必须是绝对路径", "App 用户不存在", "Owner UID/GID 缺失"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("checks missing %q: %s", want, joined)
 		}
@@ -340,6 +340,35 @@ func TestSetupPlanChecksRejectsMountPointContainingBranch(t *testing.T) {
 	joined := statusItemsText(checks)
 	if !strings.Contains(joined, "底层目录 /vol1/1000/.media_pool 在挂载入口 /vol1/1000 内") {
 		t.Fatalf("expected containing-path conflict: %+v", checks)
+	}
+}
+
+func TestSetupPlanChecksRejectsMountedMountPoint(t *testing.T) {
+	plan := SetupPlan{
+		AppUser:    "trim.media",
+		Owner:      OwnerCandidate{HomeName: "1000", UID: "1000", GID: "1000"},
+		PoolName:   ".media_pool",
+		MountPoint: "/vol1/1000/影视聚合",
+		Volumes: []Volume{
+			{Name: "vol1", Path: "/vol1", Device: "/dev/sda1", FSType: "ext4", UUID: "u1", MountState: "mounted"},
+			{Name: "vol2", Path: "/vol2", Device: "/dev/sdb1", FSType: "ext4", UUID: "u2", MountState: "mounted"},
+		},
+		Branches: []BranchState{
+			{VolumePath: "/vol1", BranchPath: "/vol1/1000/.media_pool"},
+			{VolumePath: "/vol2", BranchPath: "/vol2/1000/.media_pool"},
+		},
+	}
+	command := func(name string, args ...string) string {
+		if name == "findmnt" && len(args) == 3 && args[2] == plan.MountPoint {
+			return "fnos-mfs-fnvideo"
+		}
+		return ""
+	}
+	lookup := func(username string) (*user.User, error) { return &user.User{Username: username}, nil }
+	checks := setupPlanChecks(plan, command, lookup)
+	joined := statusItemsText(checks)
+	if !strings.Contains(joined, "挂载入口已挂载") || !hasFailedStatus(checks) {
+		t.Fatalf("expected mounted mount point failure: %+v", checks)
 	}
 }
 
@@ -418,6 +447,19 @@ func TestParseConfirm(t *testing.T) {
 	for _, input := range []string{"", "no", "1"} {
 		if parseConfirm(input) {
 			t.Fatalf("expected %q to reject", input)
+		}
+	}
+}
+
+func TestIsValidPoolName(t *testing.T) {
+	for _, name := range []string{".media_pool", "media_pool"} {
+		if !isValidPoolName(name) {
+			t.Fatalf("expected valid pool name %q", name)
+		}
+	}
+	for _, name := range []string{"", ".", "..", "bad/name", "bad:name"} {
+		if isValidPoolName(name) {
+			t.Fatalf("expected invalid pool name %q", name)
 		}
 	}
 }
