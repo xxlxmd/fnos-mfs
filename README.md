@@ -173,11 +173,12 @@ Preflight checks catch common mistakes before touching the system:
 selected volume count
 whether selected /volX paths are mounted
 duplicate volume or branch paths
-valid branch directory name
+valid branch directory name, without / or :
 absolute mount path
 app user existence
 owner UID/GID availability
 mount point conflicts with branch directories
+mounted mount point conflicts
 ```
 
 Default mergerfs options:
