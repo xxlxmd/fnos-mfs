@@ -78,7 +78,7 @@ It does not duplicate files across disks
 It does not make different disks as safe as replicated storage
 ```
 
-By default, new files use mergerfs `category.create=mfs`, meaning new files are created on the selected disk with the most free space.
+By default, new files use mergerfs `category.create=mfs`, meaning new files are created on the selected disk with the most free space. You can also choose `pfrd` during `set` so mixed-size disks are used closer to their capacity ratio.
 
 ## 🖥️ Interactive Flow
 
@@ -181,11 +181,13 @@ JSON is used instead of YAML so the Go binary can stay dependency-free.
 3. infer owner from /volX/1000-style home directories
 4. infer the default app user from the selected preset
 5. propose default branch and mount paths
-6. choose whether to edit app user, branch directory name, or mount path
+6. choose or update the create policy, for example mfs or pfrd
 7. show the execution plan
 8. run preflight checks
 9. only apply changes after you confirm the final set action
 ```
+
+Existing setups can be updated by running `set` again. For example, changing the create policy from `mfs` to `pfrd` does not require deleting directories; the tool rewrites the state file and systemd service, then restarts the current service.
 
 Confirmation prompts are explicit:
 
@@ -212,7 +214,7 @@ mounted mount point conflicts
 Default mergerfs options:
 
 ```text
-category.create=mfs
+category.create=mfs or pfrd
 moveonenospc=true
 minfreespace=10G
 allow_other
@@ -230,7 +232,16 @@ Open source repository: https://github.com/trapexit/mergerfs
 
 `fnos-mfs` is an interactive configuration helper around mergerfs. It is not mergerfs itself and does not modify the upstream mergerfs project.
 
-`category.create=mfs` means "most free space". When an app creates a new file in the merged directory, mergerfs chooses the selected branch with the most free space in absolute bytes.
+Two create policies are supported:
+
+```text
+mfs   most free space; choose the disk with the most free space in absolute bytes
+pfrd  percentage free random distribution; random distribution by free-space percentage
+```
+
+`mfs` is useful when you add a large empty disk and want new files to flow there first. `pfrd` is better for mixed-size disks such as 500G, 500G, and 1000G when you want long-term usage closer to capacity ratio.
+
+Run `set` again to update the policy. Existing files are not moved automatically; the new policy only affects newly created files.
 
 Important behavior:
 
@@ -252,7 +263,9 @@ Disk B: 1000G free
 Disk C: 2000G free
 ```
 
-With the default rule, new files first go to Disk C because it has the most free space. When Disk C drops to around 1000G free, Disk B can also become a target. Disk A usually starts receiving new files only after the larger disks drop to around 500G free. The result is closer to "keep remaining free space similar" than "keep usage percentage similar".
+With `mfs`, new files first go to Disk C because it has the most free space. When Disk C drops to around 1000G free, Disk B can also become a target. Disk A usually starts receiving new files only after the larger disks drop to around 500G free.
+
+With `pfrd`, all three empty disks start at 100% free, so writes do not keep targeting only the 2000G disk. Long term, usage trends closer to capacity ratio: 500G, 1000G, and 2000G roughly lean toward 1:2:4, not equal file counts.
 
 Example when adding a new disk:
 
@@ -474,7 +487,7 @@ mkdir -p /vol1/1000/command
 cd /vol1/1000/command
 
 curl -L -o fnos-mfs \
-  https://github.com/xxlxmd/fnos-mfs/releases/download/v0.1.2-dev/fnos-mfs
+  https://github.com/xxlxmd/fnos-mfs/releases/download/v0.1.3-dev/fnos-mfs
 
 chmod 755 fnos-mfs
 sudo ./fnos-mfs
@@ -566,7 +579,7 @@ The repository includes a manual prerelease workflow:
 Run `Prerelease` in GitHub Actions with a tag such as:
 
 ```text
-v0.1.2-dev
+v0.1.3-dev
 ```
 
 The workflow runs tests, builds `fnos-mfs`, and creates or updates a GitHub prerelease. Release notes read commit subjects and sort updates into features, fixes, docs, and other changes in both Chinese and English, with a little emoji sparkle. 🎉

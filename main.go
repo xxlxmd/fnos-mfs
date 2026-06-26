@@ -71,24 +71,26 @@ type BranchState struct {
 }
 
 type AppState struct {
-	AppID       string         `json:"app_id"`
-	AppLabel    string         `json:"app_label"`
-	AppUser     string         `json:"app_user"`
-	Owner       OwnerCandidate `json:"owner"`
-	PoolName    string         `json:"pool_name"`
-	MountPoint  string         `json:"mount_point"`
-	ServiceName string         `json:"service_name"`
-	Branches    []BranchState  `json:"branches"`
+	AppID        string         `json:"app_id"`
+	AppLabel     string         `json:"app_label"`
+	AppUser      string         `json:"app_user"`
+	Owner        OwnerCandidate `json:"owner"`
+	PoolName     string         `json:"pool_name"`
+	MountPoint   string         `json:"mount_point"`
+	CreatePolicy string         `json:"create_policy"`
+	ServiceName  string         `json:"service_name"`
+	Branches     []BranchState  `json:"branches"`
 }
 
 type SetupPlan struct {
-	App        AppConfig
-	AppUser    string
-	Owner      OwnerCandidate
-	PoolName   string
-	MountPoint string
-	Volumes    []Volume
-	Branches   []BranchState
+	App          AppConfig
+	AppUser      string
+	Owner        OwnerCandidate
+	PoolName     string
+	MountPoint   string
+	CreatePolicy string
+	Volumes      []Volume
+	Branches     []BranchState
 }
 
 type commandOutputFunc func(name string, args ...string) string
@@ -119,15 +121,17 @@ func (err unknownArgumentError) Error() string {
 }
 
 const (
-	statusOK      = "ok"
-	statusWarn    = "warn"
-	statusFail    = "fail"
-	colorReset    = "\033[0m"
-	colorGreen    = "\033[32m"
-	colorYellow   = "\033[33m"
-	colorRed      = "\033[31m"
-	customAppID   = "other"
-	customAppName = "Other"
+	statusOK         = "ok"
+	statusWarn       = "warn"
+	statusFail       = "fail"
+	colorReset       = "\033[0m"
+	colorGreen       = "\033[32m"
+	colorYellow      = "\033[33m"
+	colorRed         = "\033[31m"
+	createPolicyMFS  = "mfs"
+	createPolicyPFRD = "pfrd"
+	customAppID      = "other"
+	customAppName    = "Other"
 )
 
 var englishOutput bool
@@ -563,6 +567,52 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func normalizeCreatePolicy(policy string) string {
+	policy = strings.TrimSpace(strings.ToLower(policy))
+	if policy == "" {
+		return createPolicyMFS
+	}
+	return policy
+}
+
+func isValidCreatePolicy(policy string) bool {
+	switch normalizeCreatePolicy(policy) {
+	case createPolicyMFS, createPolicyPFRD:
+		return true
+	default:
+		return false
+	}
+}
+
+func createPolicyDescription(policy string) string {
+	switch normalizeCreatePolicy(policy) {
+	case createPolicyPFRD:
+		return ui("pfrd - 按剩余百分比随机分布，适合大小盘按比例使用", "pfrd - random by free percentage; good for proportional use across mixed-size disks")
+	default:
+		return ui("mfs - 写到剩余空间最多的盘，适合优先填大空盘", "mfs - most free space; good for filling the emptiest disk first")
+	}
+}
+
+func stateCreatePolicy(state AppState) string {
+	return normalizeCreatePolicy(state.CreatePolicy)
+}
+
+func promptCreatePolicy(reader *bufio.Reader, def string) (string, error) {
+	def = normalizeCreatePolicy(def)
+	for {
+		label := ui("写入策略", "Create policy") + " (" + createPolicyDescription(createPolicyMFS) + "; " + createPolicyDescription(createPolicyPFRD) + ")"
+		policy, err := promptDefault(reader, label, def)
+		if err != nil {
+			return "", err
+		}
+		policy = normalizeCreatePolicy(policy)
+		if isValidCreatePolicy(policy) {
+			return policy, nil
+		}
+		fmt.Println(ui("写入策略无效，请输入 mfs 或 pfrd。", "Invalid create policy; enter mfs or pfrd."))
+	}
+}
+
 func runSet(reader *bufio.Reader, app AppConfig) error {
 	volumes, err := discoverVolumes()
 	if err != nil {
@@ -586,7 +636,11 @@ func runSet(reader *bufio.Reader, app AppConfig) error {
 		return err
 	}
 
+	existingState, hasExistingState := loadState(app)
 	appUser, _ := defaultAppUser(app)
+	if hasExistingState == nil && existingState.AppUser != "" {
+		appUser = existingState.AppUser
+	}
 	if appUser == "" {
 		appUser, err = promptDefault(reader, ui("没有自动找到 App 用户，请输入真实 Linux 用户名", "App user was not detected; enter the real Linux username"), "")
 		if err != nil {
@@ -594,18 +648,35 @@ func runSet(reader *bufio.Reader, app AppConfig) error {
 		}
 	}
 
-	poolName, err := promptDefault(reader, ui("底层目录名", "Branch directory name"), app.DefaultPoolName)
+	defaultPoolName := app.DefaultPoolName
+	if hasExistingState == nil {
+		if poolName := statePoolName(existingState); poolName != "" {
+			defaultPoolName = poolName
+		}
+	}
+	poolName, err := promptDefault(reader, ui("底层目录名", "Branch directory name"), defaultPoolName)
 	if err != nil {
 		return err
 	}
 	poolName = normalizePoolNameWithNotice(poolName)
 	defaultMount := renderPathTemplate(app.PathTemplate, selectedVolumes[0].Path, owner.HomeName, app.DefaultMountDir)
+	if hasExistingState == nil && existingState.MountPoint != "" {
+		defaultMount = existingState.MountPoint
+	}
 	mountPoint, err := promptDefault(reader, ui("聚合入口路径", "Merged mount path"), defaultMount)
 	if err != nil {
 		return err
 	}
+	defaultCreatePolicy := createPolicyMFS
+	if hasExistingState == nil {
+		defaultCreatePolicy = stateCreatePolicy(existingState)
+	}
+	createPolicy, err := promptCreatePolicy(reader, defaultCreatePolicy)
+	if err != nil {
+		return err
+	}
 
-	plan := buildSetupPlan(app, appUser, owner, poolName, mountPoint, selectedVolumes)
+	plan := buildSetupPlan(app, appUser, owner, poolName, mountPoint, createPolicy, selectedVolumes)
 	plan, err = maybeCustomizePlan(reader, plan)
 	if err != nil {
 		return err
@@ -688,6 +759,7 @@ func collectAppStatus(app AppConfig) []StatusItem {
 	items = append(items, dependencyStatusItems(exec.LookPath)...)
 	if state, err := loadState(app); err == nil {
 		items = append(items, StatusItem{State: statusOK, Label: ui("已保存配置", "Saved config"), Detail: state.MountPoint})
+		items = append(items, StatusItem{State: statusOK, Label: ui("写入策略", "Create policy"), Detail: createPolicyDescription(stateCreatePolicy(state))})
 		if active := commandOutput("systemctl", "is-active", state.ServiceName+".service"); active == "active" {
 			items = append(items, StatusItem{State: statusOK, Label: "systemd", Detail: state.ServiceName + ".service active"})
 		} else if active != "" {
@@ -815,6 +887,7 @@ func runStatus(app AppConfig) error {
 	fmt.Printf("%s: %s\n", ui("挂载入口", "Merged mount"), state.MountPoint)
 	fmt.Printf("%s: %s\n", ui("底层根目录", "Branch root"), poolRootName)
 	fmt.Printf("%s: %s\n", ui("底层目录名", "Branch directory"), state.PoolName)
+	fmt.Printf("%s: %s\n", ui("写入策略", "Create policy"), createPolicyDescription(stateCreatePolicy(state)))
 	fmt.Printf("systemd: %s\n", state.ServiceName)
 	fmt.Println()
 	for _, branch := range state.Branches {
@@ -1038,7 +1111,7 @@ func defaultAppUser(app AppConfig) (string, bool) {
 }
 
 func maybeCustomizePlan(reader *bufio.Reader, plan SetupPlan) (SetupPlan, error) {
-	ok, err := confirm(reader, ui("修改 appuser/name/path 等其他选项", "Edit app user, branch name, mount path, or other options"))
+	ok, err := confirm(reader, ui("修改 appuser/name/path/写入策略 等其他选项", "Edit app user, branch name, mount path, create policy, or other options"))
 	if err != nil || !ok {
 		return plan, err
 	}
@@ -1055,11 +1128,16 @@ func maybeCustomizePlan(reader *bufio.Reader, plan SetupPlan) (SetupPlan, error)
 	if err != nil {
 		return plan, err
 	}
-	return buildSetupPlan(plan.App, appUser, plan.Owner, poolName, mountPoint, plan.Volumes), nil
+	createPolicy, err := promptCreatePolicy(reader, plan.CreatePolicy)
+	if err != nil {
+		return plan, err
+	}
+	return buildSetupPlan(plan.App, appUser, plan.Owner, poolName, mountPoint, createPolicy, plan.Volumes), nil
 }
 
-func buildSetupPlan(app AppConfig, appUser string, owner OwnerCandidate, poolName string, mountPoint string, volumes []Volume) SetupPlan {
+func buildSetupPlan(app AppConfig, appUser string, owner OwnerCandidate, poolName string, mountPoint string, createPolicy string, volumes []Volume) SetupPlan {
 	poolName = normalizePoolName(poolName)
+	createPolicy = normalizeCreatePolicy(createPolicy)
 	branches := make([]BranchState, 0, len(volumes))
 	for _, vol := range volumes {
 		branches = append(branches, BranchState{
@@ -1070,7 +1148,7 @@ func buildSetupPlan(app AppConfig, appUser string, owner OwnerCandidate, poolNam
 	}
 	return SetupPlan{
 		App: app, AppUser: appUser, Owner: owner, PoolName: poolName,
-		MountPoint: mountPoint, Volumes: volumes, Branches: branches,
+		MountPoint: mountPoint, CreatePolicy: createPolicy, Volumes: volumes, Branches: branches,
 	}
 }
 
@@ -1115,6 +1193,12 @@ func setupPlanChecks(plan SetupPlan, command commandOutputFunc, lookupUser userL
 		add(statusOK, ui("聚合入口路径", "Merged mount path"), plan.MountPoint)
 	} else {
 		add(statusFail, ui("聚合入口路径必须是绝对路径", "Merged mount path must be absolute"), plan.MountPoint)
+	}
+
+	if isValidCreatePolicy(plan.CreatePolicy) {
+		add(statusOK, ui("写入策略", "Create policy"), createPolicyDescription(plan.CreatePolicy))
+	} else {
+		add(statusFail, ui("写入策略无效", "Invalid create policy"), plan.CreatePolicy)
 	}
 
 	if plan.AppUser == "" {
@@ -1352,7 +1436,7 @@ func applySetup(plan SetupPlan) error {
 	state := AppState{
 		AppID: plan.App.ID, AppLabel: plan.App.Label, AppUser: plan.AppUser,
 		Owner: plan.Owner, PoolName: plan.PoolName, MountPoint: plan.MountPoint,
-		ServiceName: plan.App.ServiceName, Branches: plan.Branches,
+		CreatePolicy: plan.CreatePolicy, ServiceName: plan.App.ServiceName, Branches: plan.Branches,
 	}
 	if err := applyACL(state, plan.AppUser); err != nil {
 		return fmt.Errorf(ui("设置 ACL 失败: %w", "failed to set ACL: %w"), err)
@@ -1530,7 +1614,7 @@ func writeService(state AppState) error {
 
 func renderService(state AppState, mergerfsPath string, fusermountPath string) string {
 	branches := strings.Join(branchPaths(state.Branches), ":")
-	options := "defaults,allow_other,use_ino,cache.files=off,category.create=mfs,moveonenospc=true,minfreespace=10G,fsname=" + state.ServiceName + ",umask=000"
+	options := "defaults,allow_other,use_ino,cache.files=off,category.create=" + stateCreatePolicy(state) + ",moveonenospc=true,minfreespace=10G,fsname=" + state.ServiceName + ",umask=000"
 	requires := append(branchPaths(state.Branches), state.MountPoint)
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "[Unit]\n")
@@ -1765,6 +1849,7 @@ func printPlan(plan SetupPlan) {
 	fmt.Printf("%s: %s\n", ui("底层根目录", "Branch root"), poolRootName)
 	fmt.Printf("%s: %s\n", ui("底层目录名", "Branch directory"), plan.PoolName)
 	fmt.Printf("%s: %s\n", ui("聚合入口", "Merged mount"), plan.MountPoint)
+	fmt.Printf("%s: %s\n", ui("写入策略", "Create policy"), createPolicyDescription(plan.CreatePolicy))
 	fmt.Printf("systemd: %s.service\n", plan.App.ServiceName)
 	fmt.Println(ui("分支目录：", "Branch directories:"))
 	for _, branch := range plan.Branches {

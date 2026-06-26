@@ -405,7 +405,7 @@ func TestBuildSetupPlan(t *testing.T) {
 		{Name: "vol2", Path: "/vol2", UUID: "u2"},
 		{Name: "vol3", Path: "/vol3", UUID: "u3"},
 	}
-	plan := buildSetupPlan(app, "trim.media", owner, ".media_pool", "/vol2/1000/影视文件合集", volumes)
+	plan := buildSetupPlan(app, "trim.media", owner, ".media_pool", "/vol2/1000/影视文件合集", createPolicyMFS, volumes)
 	if len(plan.Branches) != 2 {
 		t.Fatalf("branches len = %d, want 2", len(plan.Branches))
 	}
@@ -420,9 +420,12 @@ func TestBuildSetupPlan(t *testing.T) {
 func TestBuildSetupPlanNormalizesPoolRootPrefix(t *testing.T) {
 	app := AppConfig{ID: "fnvideo", Label: "飞牛影视", ServiceName: "fnos-mfs-fnvideo"}
 	owner := OwnerCandidate{HomeName: "1000", UID: "1000", GID: "1000", UserName: "XHOME"}
-	plan := buildSetupPlan(app, "trim.media", owner, "mfs_pools/.media_pool", "/vol1/1000/影视聚合", []Volume{{Name: "vol1", Path: "/vol1"}})
+	plan := buildSetupPlan(app, "trim.media", owner, "mfs_pools/.media_pool", "/vol1/1000/影视聚合", createPolicyPFRD, []Volume{{Name: "vol1", Path: "/vol1"}})
 	if plan.PoolName != ".media_pool" {
 		t.Fatalf("pool name = %q, want .media_pool", plan.PoolName)
+	}
+	if plan.CreatePolicy != createPolicyPFRD {
+		t.Fatalf("create policy = %q, want pfrd", plan.CreatePolicy)
 	}
 	if plan.Branches[0].BranchPath != "/vol1/1000/mfs_pools/.media_pool" {
 		t.Fatalf("branch path = %q", plan.Branches[0].BranchPath)
@@ -593,12 +596,12 @@ func TestMaybeCustomizePlanAppliesOverrides(t *testing.T) {
 		MountPoint: "/vol1/1000/影视聚合",
 		Volumes:    []Volume{{Path: "/vol1"}, {Path: "/vol2"}},
 	}
-	reader := bufio.NewReader(strings.NewReader("yes\ncustom.user\n.custom_pool\n/vol1/1000/custom\n"))
+	reader := bufio.NewReader(strings.NewReader("yes\ncustom.user\n.custom_pool\n/vol1/1000/custom\npfrd\n"))
 	got, err := maybeCustomizePlan(reader, plan)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.AppUser != "custom.user" || got.PoolName != ".custom_pool" || got.MountPoint != "/vol1/1000/custom" {
+	if got.AppUser != "custom.user" || got.PoolName != ".custom_pool" || got.MountPoint != "/vol1/1000/custom" || got.CreatePolicy != createPolicyPFRD {
 		t.Fatalf("unexpected overrides: %+v", got)
 	}
 	if got.Branches[1].BranchPath != "/vol2/1000/mfs_pools/.custom_pool" {
@@ -866,6 +869,23 @@ func TestRenderService(t *testing.T) {
 		if !strings.Contains(service, want) {
 			t.Fatalf("service missing %q\n%s", want, service)
 		}
+	}
+}
+
+func TestRenderServiceUsesCreatePolicy(t *testing.T) {
+	state := AppState{
+		AppID:        "fnvideo",
+		ServiceName:  "fnos-mfs-fnvideo",
+		MountPoint:   "/vol1/1000/Media",
+		CreatePolicy: createPolicyPFRD,
+		Branches: []BranchState{
+			{BranchPath: "/vol1/1000/mfs_pools/.media_pool"},
+			{BranchPath: "/vol2/1000/mfs_pools/.media_pool"},
+		},
+	}
+	service := renderService(state, "/usr/bin/mergerfs", "/usr/bin/fusermount3")
+	if !strings.Contains(service, "category.create=pfrd") {
+		t.Fatalf("service missing pfrd policy:\n%s", service)
 	}
 }
 
