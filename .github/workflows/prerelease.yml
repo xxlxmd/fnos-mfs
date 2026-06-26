@@ -6,11 +6,11 @@ on:
       tag:
         description: "Prerelease tag"
         required: true
-        default: "v0.1.0-dev"
+        default: "v0.1.2-dev"
       title:
         description: "Release title"
         required: true
-        default: "fnos-mfs v0.1.0-dev"
+        default: "fnos-mfs v0.1.2-dev"
 
 permissions:
   contents: write
@@ -23,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v6
@@ -36,7 +38,129 @@ jobs:
       - name: Build Linux amd64
         run: |
           mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/fnos-mfs-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/fnos-mfs .
+
+      - name: Generate bilingual release notes
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          previous_tag="$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -n 1 || true)"
+          if [ -n "$previous_tag" ]; then
+            range="${previous_tag}..HEAD"
+            range_label="${previous_tag}..HEAD"
+          else
+            range="HEAD"
+            range_label="current branch history"
+          fi
+
+          commits=()
+          while IFS= read -r subject; do
+            commits+=("$subject")
+          done < <(git log --no-merges --pretty=format:'%s' "$range")
+          if [ "${#commits[@]}" -eq 0 ]; then
+            while IFS= read -r subject; do
+              commits+=("$subject")
+            done < <(git log --no-merges -n 20 --pretty=format:'%s')
+            range_label="latest 20 commits"
+          fi
+
+          features=()
+          fixes=()
+          docs=()
+          other=()
+
+          for subject in "${commits[@]}"; do
+            lower="$(printf '%s' "$subject" | tr '[:upper:]' '[:lower:]')"
+            matched=0
+            if [[ "$lower" =~ ^(feat|feature)(\(.+\))?!?: ]] || [[ "$lower" == *"新增"* ]] || [[ "$lower" == *"增加"* ]] || [[ "$lower" == *"支持"* ]] || [[ "$lower" == *"自动"* ]]; then
+              features+=("$subject")
+              matched=1
+            fi
+            if [[ "$lower" =~ ^fix(\(.+\))?!?: ]] || [[ "$lower" == *"bug"* ]] || [[ "$lower" == *"修复"* ]] || [[ "$lower" == *"修正"* ]] || [[ "$lower" == *"报错"* ]] || [[ "$lower" == *"失败"* ]]; then
+              fixes+=("$subject")
+              matched=1
+            fi
+            if [[ "$lower" =~ ^(docs|doc)(\(.+\))?!?: ]] || [[ "$lower" == *"readme"* ]] || [[ "$lower" == *"文档"* ]]; then
+              docs+=("$subject")
+              matched=1
+            fi
+            if [ "$matched" -eq 0 ]; then
+              other+=("$subject")
+            fi
+          done
+
+          write_bucket() {
+            local fallback="$1"
+            shift
+            if [ "$#" -eq 0 ]; then
+              printf -- '- %s\n' "$fallback"
+              return
+            fi
+            for item in "$@"; do
+              printf -- '- %s\n' "$item"
+            done
+          }
+
+          set +u
+          {
+            echo "## 🎉 中文"
+            echo
+            echo "这次预发布会读取 commit 内容，自动把新功能、修复和文档更新分好类。少一点手写，多一点省心。"
+            echo
+            echo "### ✨ 新功能"
+            write_bucket "这次没有单独识别到新功能 commit，但小工具依然精神在线。" "${features[@]}"
+            echo
+            echo "### 🐛 修复"
+            write_bucket "这次没有单独识别到修复 commit，先把它当作一个安静的好消息。" "${fixes[@]}"
+            echo
+            echo "### 📝 文档"
+            write_bucket "这次没有单独识别到文档 commit。" "${docs[@]}"
+            echo
+            echo "### 🧰 其他"
+            write_bucket "没有其他条目。今天也算清爽。" "${other[@]}"
+            echo
+            echo "### 🧪 验证"
+            echo "- go test ./..."
+            echo "- go build linux/amd64 -> dist/fnos-mfs"
+            echo
+            echo "### ⚠️ 小提醒"
+            echo "- 这个工具会修改 mergerfs、ACL、FUSE 和 systemd 配置。先在非关键数据上试一圈，别让媒体库替你冒险。"
+            echo
+            echo "## 🌍 English"
+            echo
+            echo "This prerelease reads commit subjects and sorts them into features, fixes, docs, and other updates. Less hand-written release note gardening, more useful signal."
+            echo
+            echo "### ✨ Features"
+            write_bucket "No dedicated feature commit was detected this time, but the little CLI is still doing its job." "${features[@]}"
+            echo
+            echo "### 🐛 Fixes"
+            write_bucket "No dedicated fix commit was detected this time. Quiet can be good." "${fixes[@]}"
+            echo
+            echo "### 📝 Docs"
+            write_bucket "No dedicated docs commit was detected this time." "${docs[@]}"
+            echo
+            echo "### 🧰 Other"
+            write_bucket "No other entries. Nice and tidy." "${other[@]}"
+            echo
+            echo "### 🧪 Checks"
+            echo "- go test ./..."
+            echo "- go build linux/amd64 -> dist/fnos-mfs"
+            echo
+            echo "### ⚠️ Friendly Warning"
+            echo "- This tool modifies mergerfs, ACL, FUSE, and systemd configuration. Test on non-critical data first; your media library deserves a calm afternoon."
+            echo
+            echo "<details>"
+            echo "<summary>🧾 Commit source / 提交来源</summary>"
+            echo
+            echo "Range: ${range_label}"
+            echo
+            write_bucket "No commit subjects were found." "${commits[@]}"
+            echo
+            echo "</details>"
+          } > release_notes.md
+          set -u
 
       - name: Publish prerelease
         env:
@@ -46,21 +170,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          notes=$(cat <<'NOTES'
-          fnos-mfs prerelease build.
-
-          This binary modifies mergerfs, ACL, fuse, and systemd configuration.
-          Test on non-critical data first and keep backups.
-          NOTES
-          )
-
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/fnos-mfs-linux-amd64 --clobber
-            gh release edit "$TAG" --title "$TITLE" --notes "$notes" --prerelease
+            gh release delete-asset "$TAG" fnos-mfs-linux-amd64 -y >/dev/null 2>&1 || true
+            gh release upload "$TAG" dist/fnos-mfs --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes-file release_notes.md --prerelease
           else
-            gh release create "$TAG" dist/fnos-mfs-linux-amd64 \
+            gh release create "$TAG" dist/fnos-mfs \
               --title "$TITLE" \
-              --notes "$notes" \
+              --notes-file release_notes.md \
               --prerelease \
               --target "$GITHUB_SHA"
           fi
