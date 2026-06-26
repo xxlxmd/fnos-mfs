@@ -12,7 +12,8 @@ check: test build
 
 linux-amd64:
 	mkdir -p dist
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/$(BINARY)-linux-amd64 .
+	rm -f dist/$(BINARY)-linux-amd64
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/$(BINARY) .
 
 clean:
 	rm -rf $(BINARY) dist
